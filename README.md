@@ -76,6 +76,38 @@ export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的新Token'
 
 ## 4. 启动
 
+### 后台服务（推荐）
+
+首次安装运行：
+
+```bash
+bash scripts/music_service.sh install
+```
+
+安装程序会询问：
+
+```text
+是否启用登录自动启动？[y/N]
+```
+
+默认选择 `N`：服务立即在 macOS LaunchAgent 中运行，关闭终端或退出 Codex 后仍会继续工作，但下次登录不会自动启动。选择 `Y` 则同时开启登录自启动。
+
+日常管理命令：
+
+```bash
+bash scripts/music_service.sh start
+bash scripts/music_service.sh stop
+bash scripts/music_service.sh restart
+bash scripts/music_service.sh status
+bash scripts/music_service.sh enable-autostart
+bash scripts/music_service.sh disable-autostart
+bash scripts/music_service.sh logs
+```
+
+`disable-autostart` 不会中断正在运行的服务，只会阻止它在下次登录时自动启动。`stop` 不会改变自启动设置。
+
+### 前台运行
+
 ```bash
 source .venv/bin/activate
 python mcp_pipe.py
@@ -106,7 +138,7 @@ python mcp_pipe.py
 - “播放乐鑫官方测试音频”
 - “播放海阔天空 Beyond”（需要相应音乐源中存在该歌曲）
 
-停止服务请按 `Ctrl+C`。
+前台运行时，停止服务请按 `Ctrl+C`。
 
 ## 本地测试
 
