@@ -10,10 +10,12 @@
 music_mcp_server.py（解析 URL）
         ↕ stdio
     mcp_pipe.py ↔ 小智云端 ↔ EchoEar 的 self.online_music.play_music（播放）
+        ↳ :8765/official-test.mp3（仅代理乐鑫官方测试音频）
 ```
 
 - `mcp_pipe.py` 主动连接 `MCP_ENDPOINT`，因此本地运行时不需要公网 IP 或端口映射。
 - `music_mcp_server.py` 是标准 FastMCP stdio 服务。
+- `mcp_pipe.py` 会在局域网启动固定路径的音频代理，解决部分 ESP32 无法直连乐鑫 CDN 的问题；默认端口为 `8765`。
 - 电脑必须保持开机、联网，桥接程序必须持续运行。
 
 ## 1. 获取新的 MCP 接入点
@@ -49,7 +51,10 @@ cp .env.example .env
 ```dotenv
 MCP_ENDPOINT=wss://api.xiaozhi.me/mcp/?token=你的新Token
 LOG_LEVEL=INFO
+MUSIC_PROXY_PORT=8765
 ```
+
+当前 EchoEar 测试固件固定允许端口 `8765`，请勿修改该值。
 
 `.env` 已加入 `.gitignore`。
 
@@ -72,6 +77,7 @@ python mcp_pipe.py
 连接小智 MCP 接入点：wss://api.xiaozhi.me/mcp/?token=***
 小智 MCP 接入点连接成功
 已启动本地 MCP 服务：.../music_mcp_server.py
+乐鑫官方测试音频局域网代理已启动：http://局域网IP:8765/official-test.mp3
 ```
 
 然后回到小智控制台刷新 MCP 接入点，应能看到在线状态和 1 个工具：`resolve_music_url`。
@@ -111,6 +117,7 @@ python test_mcp.py
 ## 当前限制
 
 - 仅开放乐鑫官方 MP3 测试音频，不提供商业歌曲目录。
+- EchoEar 与运行 MCP 的电脑必须在同一局域网，且本机防火墙需允许 Python 接收 TCP 8765 端口的局域网连接。
 - EchoEar 的 URL 播放仍可能经过 Nologo 在线音乐后台，并受设备端 `config_music_player_enabled`、账号或名额限制。
 - 后续接入真实音乐服务时，只扩展解析器即可；设备播放工具保持不变。
 

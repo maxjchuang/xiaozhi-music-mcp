@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
@@ -81,18 +82,19 @@ async def resolve_music_url(
             ensure_ascii=False,
         )
 
+    audio_url = os.getenv("MUSIC_PROXY_URL", "").strip() or track["audio_url"]
     return json.dumps(
         {
             "success": True,
             "title": track["title"],
             "artist": track["artist"],
-            "audio_url": track["audio_url"],
+            "audio_url": audio_url,
             "content_type": track["content_type"],
             "next_step": "立即调用设备端 MCP 工具 self.online_music.play_music",
             "device_tool": "self.online_music.play_music",
             "device_arguments": {
                 "play_type": "url",
-                "url": track["audio_url"],
+                "url": audio_url,
                 "url_song_name": track["title"],
             },
         },

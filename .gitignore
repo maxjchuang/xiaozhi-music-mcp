@@ -28,6 +28,7 @@ ENV/
 
 # Local secrets
 .env
+logs/
 
 # IDE
 .vscode/

@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import asyncio
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import socket
 import ssl
 import sys
+import threading
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
@@ -19,6 +25,75 @@ import websockets
 LOGGER = logging.getLogger("xiaozhi-mcp-pipe")
 INITIAL_BACKOFF_SECONDS = 1
 MAX_BACKOFF_SECONDS = 60
+OFFICIAL_TEST_AUDIO_URL = "https://dl.espressif.com/dl/audio/ff-16b-2c-44100hz.mp3"
+PROXY_PATH = "/official-test.mp3"
+
+
+def upstream_ssl_context() -> ssl.SSLContext:
+    """Build a verified context compatible with the Espressif CDN chain."""
+    context = ssl.create_default_context()
+    # Python 3.13 enables X509 strict mode by default. The Espressif CDN chain
+    # is trusted by the system but lacks an Authority Key Identifier on one
+    # certificate; retain CA and hostname verification while relaxing only
+    # that additional structural check.
+    if hasattr(ssl, "VERIFY_X509_STRICT"):
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return context
+
+
+class OfficialAudioProxyHandler(BaseHTTPRequestHandler):
+    """Expose only the approved Espressif test asset to the local network."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path != PROXY_PATH:
+            self.send_error(404)
+            return
+
+        headers = {"User-Agent": "xiaozhi-music-mcp/1.0", "Accept": "audio/mpeg"}
+        if range_header := self.headers.get("Range"):
+            headers["Range"] = range_header
+        request = Request(OFFICIAL_TEST_AUDIO_URL, headers=headers)
+        try:
+            with urlopen(request, timeout=30, context=upstream_ssl_context()) as upstream:
+                self.send_response(upstream.status)
+                for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                    if value := upstream.headers.get(name):
+                        self.send_header(name, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while chunk := upstream.read(64 * 1024):
+                    self.wfile.write(chunk)
+        except HTTPError as exc:
+            LOGGER.warning("官方测试音频上游返回 HTTP %s", exc.code)
+            self.send_error(502, "upstream HTTP error")
+        except (URLError, TimeoutError, OSError) as exc:
+            LOGGER.warning("官方测试音频代理失败：%s", exc)
+            self.send_error(502, "upstream unavailable")
+
+    def log_message(self, message_format: str, *args: object) -> None:
+        LOGGER.info("[audio-proxy] %s", message_format % args)
+
+
+def discover_lan_ip() -> str:
+    """Discover the IPv4 address used for outbound LAN traffic."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.connect(("192.168.31.1", 9))
+        return str(probe.getsockname()[0])
+
+
+def start_audio_proxy() -> ThreadingHTTPServer:
+    port = int(os.getenv("MUSIC_PROXY_PORT", "8765"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), OfficialAudioProxyHandler)
+    server.daemon_threads = True
+    lan_ip = discover_lan_ip()
+    proxy_url = f"http://{lan_ip}:{port}{PROXY_PATH}"
+    os.environ["MUSIC_PROXY_URL"] = proxy_url
+    thread = threading.Thread(target=server.serve_forever, name="audio-proxy", daemon=True)
+    thread.start()
+    LOGGER.info("乐鑫官方测试音频局域网代理已启动：%s", proxy_url)
+    return server
 
 
 def redact_endpoint(endpoint: str) -> str:
@@ -132,9 +207,20 @@ async def run_forever(endpoint: str, server_script: Path) -> None:
 
 def main() -> int:
     load_dotenv()
+    log_dir = Path(__file__).with_name("logs")
+    log_dir.mkdir(exist_ok=True)
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=(
+            logging.StreamHandler(),
+            RotatingFileHandler(
+                log_dir / "mcp_pipe.log",
+                maxBytes=2 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            ),
+        ),
     )
 
     endpoint = os.getenv("MCP_ENDPOINT", "").strip()
@@ -155,9 +241,18 @@ def main() -> int:
         return 2
 
     try:
+        proxy = start_audio_proxy()
+    except (OSError, ValueError) as exc:
+        LOGGER.error("无法启动测试音频代理：%s", exc)
+        return 2
+
+    try:
         asyncio.run(run_forever(endpoint, server_script))
     except KeyboardInterrupt:
         LOGGER.info("已停止 MCP 桥接")
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
     return 0
 
 
