@@ -1,13 +1,13 @@
 services:
-  - type: web
+  - type: worker
     name: xiaozhi-music-mcp
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python3 music_mcp_websocket_server.py
+    startCommand: python3 mcp_pipe.py music_mcp_server.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.18
-      - key: PORT
-        value: 8765
+      - key: MCP_ENDPOINT
+        sync: false
     autoDeploy: false

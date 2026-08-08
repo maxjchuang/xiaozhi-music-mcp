@@ -1,3 +1,7 @@
+# ⚠️ 旧版使用指南
+
+> 本文记录旧版入站 WebSocket/stdio 演示，不能直接用于小智云端接入。请以 [README.md](README.md) 的 `MCP_ENDPOINT + mcp_pipe.py` 主动连接方式为准。
+
 # 🎵 免费音乐MCP服务器 - 使用指南
 
 ## 📋 项目概述

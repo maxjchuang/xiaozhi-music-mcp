@@ -36,6 +36,7 @@ fi
 # 设置执行权限
 echo "🔧 设置文件权限..."
 chmod +x music_mcp_server.py
+chmod +x mcp_pipe.py
 
 # 测试服务器
 echo "🧪 测试MCP服务器..."
@@ -62,15 +63,13 @@ echo ""
 echo "🎉 安装完成！"
 echo "================================"
 echo "📍 服务器路径: $(pwd)/music_mcp_server.py"
-echo "📋 配置文件: $(pwd)/xiaozhi_mcp_config.json"
+echo "🔌 桥接程序: $(pwd)/mcp_pipe.py"
 echo ""
 echo "📖 下一步操作:"
 echo "1. 登录 xiaozhi.me 控制台"
-echo "2. 进入智能体配置页面"
-echo "3. 添加MCP接入点配置:"
-echo "   - 命令: python3"
-echo "   - 参数: $(pwd)/music_mcp_server.py"
-echo "   - 传输: stdio"
+echo "2. 在智能体配置页面复制新的 MCP 接入点"
+echo "3. 设置环境变量: export MCP_ENDPOINT='wss://...新Token'"
+echo "4. 启动桥接: python3 mcp_pipe.py"
 echo ""
 echo "🎵 现在您可以对小智AI说："
 echo "   - '搜索周杰伦的歌曲'"

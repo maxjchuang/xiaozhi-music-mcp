@@ -11,8 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制应用代码
 COPY . .
 
-# 暴露端口
-EXPOSE 8765
-
-# 启动命令
-CMD ["python3", "music_mcp_websocket_server.py"]
+# 程序主动连接小智 MCP_ENDPOINT，不需要暴露入站端口
+CMD ["python3", "mcp_pipe.py", "music_mcp_server.py"]

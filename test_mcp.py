@@ -1,108 +1,63 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-测试MCP服务器功能
-"""
+"""End-to-end smoke test for the stdio MCP server."""
 
-import json
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
 import sys
-import subprocess
-import time
 
-def test_mcp_server():
-    """测试MCP服务器基本功能"""
-    print("🧪 开始测试免费音乐MCP服务器...")
-    
-    # 测试消息
-    test_messages = [
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "clientInfo": {
-                    "name": "test-client",
-                    "version": "1.0.0"
-                }
-            }
-        },
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list"
-        }
-    ]
-    
-    try:
-        # 启动MCP服务器进程
-        process = subprocess.Popen(
-            ["python3", "music_mcp_server.py"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd="/Users/a1234/Documents/music"
-        )
-        
-        print("✅ MCP服务器进程已启动")
-        
-        # 发送初始化消息
-        for i, message in enumerate(test_messages, 1):
-            print(f"📤 发送测试消息 {i}: {message['method']}")
-            
-            # 发送JSON-RPC消息
-            json_message = json.dumps(message) + "\n"
-            process.stdin.write(json_message)
-            process.stdin.flush()
-            
-            # 等待响应
-            time.sleep(1)
-            
-        print("✅ 测试消息发送完成")
-        
-        # 等待一段时间让服务器处理
-        time.sleep(2)
-        
-        # 终止进程
-        process.terminate()
-        process.wait(timeout=5)
-        
-        print("✅ MCP服务器测试完成")
-        return True
-        
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        if 'process' in locals():
-            process.terminate()
-        return False
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-def main():
-    """主函数"""
-    print("=" * 50)
-    print("🎵 免费音乐MCP服务器测试工具")
-    print("=" * 50)
-    
-    success = test_mcp_server()
-    
-    print("\n" + "=" * 50)
-    if success:
-        print("🎉 所有测试通过！")
-        print("\n📋 配置信息:")
-        print("   服务器路径: /Users/a1234/Documents/music/music_mcp_server.py")
-        print("   启动命令: python3 /Users/a1234/Documents/music/music_mcp_server.py")
-        print("   传输协议: stdio")
-        print("\n🔧 小智AI配置:")
-        print("   1. 登录 xiaozhi.me 控制台")
-        print("   2. 添加MCP接入点")
-        print("   3. 使用上述配置信息")
-    else:
-        print("❌ 测试失败，请检查配置")
-        sys.exit(1)
-    print("=" * 50)
+
+PROJECT_DIR = Path(__file__).resolve().parent
+EXPECTED_TOOLS = {"resolve_music_url"}
+
+
+def text_from_result(result: object) -> str:
+    content = getattr(result, "content", [])
+    return "\n".join(
+        item.text for item in content if getattr(item, "type", None) == "text"
+    )
+
+
+async def test_mcp_server() -> None:
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=[str(PROJECT_DIR / "music_mcp_server.py")],
+    )
+    async with stdio_client(parameters) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            initialized = await session.initialize()
+            assert initialized.serverInfo.name == "xiaozhi-music-resolver"
+
+            tools = await session.list_tools()
+            tool_names = {tool.name for tool in tools.tools}
+            assert tool_names == EXPECTED_TOOLS, tool_names
+
+            resolved = await session.call_tool(
+                "resolve_music_url", {"query": "播放乐鑫官方测试音频"}
+            )
+            payload = text_from_result(resolved)
+            assert '"success": true' in payload
+            assert '"device_tool": "self.online_music.play_music"' in payload
+            assert '"play_type": "url"' in payload
+            assert "https://dl.espressif.com/dl/audio/" in payload
+
+            unsupported = await session.call_tool(
+                "resolve_music_url", {"query": "一首不在白名单里的歌"}
+            )
+            assert '"success": false' in text_from_result(unsupported)
+
+            invalid = await session.call_tool("resolve_music_url", {"query": ""})
+            assert invalid.isError is True
+
+
+def main() -> None:
+    asyncio.run(test_mcp_server())
+    print("✅ 标准 MCP 握手、URL 解析、设备工具交接和参数校验测试通过")
+
 
 if __name__ == "__main__":
     main()

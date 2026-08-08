@@ -1,5 +1,6 @@
-# 音乐MCP服务器依赖包
-httpx>=0.24.0
+# 小智 MCP 桥接和标准 stdio MCP 服务
+fastmcp>=2.13.0
+mcp>=1.20.0,<2
 pydantic>=2.0.0
-aiofiles>=23.0.0
-websockets>=11.0.0
+python-dotenv>=1.2.1
+websockets>=15.0.1

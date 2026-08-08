@@ -1,3 +1,7 @@
+# ⚠️ 旧版云端方案
+
+> 原方案的入站 WebSocket 方向不适用于小智 MCP 接入点。当前 Docker、Railway 和 Render 入口已经改为运行 `mcp_pipe.py`，部署时必须安全设置 `MCP_ENDPOINT`。具体步骤以 [README.md](README.md) 为准。
+
 # ☁️ 小智AI免费音乐服务器 - 云端解决方案
 
 ## 🎯 解决方案概述

@@ -1,159 +1,121 @@
-# 免费音乐MCP服务器
+# 小智音乐 MCP 服务
 
-这是一个专为小智AI音响设计的免费音乐MCP（模型上下文协议）服务器，提供音乐搜索、播放控制等功能。
+这是一个运行在个人电脑或云主机上的小智外部 MCP 服务。程序通过小智控制台提供的 WebSocket 接入点主动连接小智云端，为 EchoEar（喵伴）的设备端在线音乐工具解析音频直链。
 
-## 功能特性
+> 当前版本用于打通首条真实播放链路：外部 MCP 只返回乐鑫官方测试音频 URL，真正的播放由 EchoEar 固件内置的 `self.online_music.play_music` 执行。
 
-- 🎵 **音乐搜索**: 支持按歌曲名、歌手名搜索
-- ▶️ **播放控制**: 播放、暂停、停止、上一首、下一首
-- 🔊 **音量控制**: 调节播放音量（0-100）
-- 📝 **播放列表**: 添加、查看、清空播放列表
-- 🆓 **完全免费**: 基于开源协议，无需付费
-- 🔌 **标准接口**: 遵循MCP协议标准
+## 工作方式
 
-## 安装配置
+```text
+music_mcp_server.py（解析 URL）
+        ↕ stdio
+    mcp_pipe.py ↔ 小智云端 ↔ EchoEar 的 self.online_music.play_music（播放）
+```
 
-### 1. 环境准备
+- `mcp_pipe.py` 主动连接 `MCP_ENDPOINT`，因此本地运行时不需要公网 IP 或端口映射。
+- `music_mcp_server.py` 是标准 FastMCP stdio 服务。
+- 电脑必须保持开机、联网，桥接程序必须持续运行。
 
-确保已安装Python 3.8+：
+## 1. 获取新的 MCP 接入点
+
+1. 登录 [xiaozhi.me](https://xiaozhi.me)。
+2. 进入对应设备或智能体的“配置角色”页面。
+3. 点击“MCP 接入点”，复制 `wss://api.xiaozhi.me/mcp/?token=...` 地址。
+4. 如果曾经使用过本仓库旧配置中的 Token，请在控制台撤销它并生成新 Token。
+
+不要把真实接入点提交到 Git。
+
+## 2. 安装
+
+要求 Python 3.10 或更高版本。
+
 ```bash
-python3 --version
+cd /Users/bytedance/Projects/github/xiaozhi-music-mcp
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 2. 安装依赖
+## 3. 配置
+
+推荐使用 `.env`：
 
 ```bash
-cd /Users/a1234/Documents/music
-pip3 install -r requirements.txt
+cp .env.example .env
 ```
 
-### 3. 测试服务器
+编辑 `.env`，把占位地址换成刚生成的接入点：
+
+```dotenv
+MCP_ENDPOINT=wss://api.xiaozhi.me/mcp/?token=你的新Token
+LOG_LEVEL=INFO
+```
+
+`.env` 已加入 `.gitignore`。
+
+也可以只在当前终端设置：
 
 ```bash
-python3 music_mcp_server.py
+export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的新Token'
 ```
 
-### 4. 小智AI配置
+## 4. 启动
 
-#### 步骤1：获取MCP接入点
-1. 登录 [xiaozhi.me](https://xiaozhi.me) 控制台
-2. 进入智能体的配置角色页面
-3. 在右下角找到该智能体专属的MCP接入点
-
-#### 步骤2：配置MCP服务器
-在小智AI控制台中添加以下配置：
-
-```json
-{
-  "name": "免费音乐服务器",
-  "command": "python3",
-  "args": ["/Users/a1234/Documents/music/music_mcp_server.py"],
-  "transport": "stdio"
-}
+```bash
+source .venv/bin/activate
+python mcp_pipe.py
 ```
 
-## 使用方法
+成功时会看到：
 
-配置完成后，您可以通过语音或文字与小智AI交互：
+```text
+连接小智 MCP 接入点：wss://api.xiaozhi.me/mcp/?token=***
+小智 MCP 接入点连接成功
+已启动本地 MCP 服务：.../music_mcp_server.py
+```
 
-### 音乐搜索
-- "搜索周杰伦的歌曲"
-- "找一些流行音乐"
-- "搜索青花瓷"
+然后回到小智控制台刷新 MCP 接入点，应能看到在线状态和 1 个工具：`resolve_music_url`。
 
-### 播放控制
-- "播放青花瓷"
-- "暂停音乐"
-- "继续播放"
-- "停止播放"
-- "下一首歌"
-- "上一首歌"
+角色人物介绍应加入：
 
-### 音量控制
-- "音量调到80"
-- "声音小一点"
-- "音量设置为50"
+```text
+收到音乐相关需求时，禁止使用 search_music、官方 play_music 和 self.music.play_song。
+先调用外部 MCP 工具 resolve_music_url 获得音频 URL。
+解析成功后，必须立即调用设备端 MCP 工具 self.online_music.play_music，
+并原样使用 resolve_music_url 返回的 device_arguments。
+```
 
-### 播放列表管理
-- "显示播放列表"
-- "添加这首歌到播放列表"
-- "清空播放列表"
+必要时重启小智设备，再尝试：
+
+- “播放乐鑫官方测试音频”
+
+停止服务请按 `Ctrl+C`。
+
+## 本地测试
+
+不连接小智也可以验证标准 MCP 握手和工具调用：
+
+```bash
+source .venv/bin/activate
+python test_mcp.py
+```
+
+直接运行 `python music_mcp_server.py` 时程序会等待 stdio MCP 请求，这属于正常现象；日常接入小智应运行 `mcp_pipe.py`。
 
 ## 可用工具
 
-| 工具名称 | 功能描述 | 参数 |
-|---------|---------|------|
-| search_music | 搜索音乐 | query（搜索关键词）, limit（结果数量） |
-| play_music | 播放指定歌曲 | song_id（歌曲ID）, song_name, artist |
-| pause_music | 暂停播放 | 无 |
-| resume_music | 继续播放 | 无 |
-| stop_music | 停止播放 | 无 |
-| next_song | 下一首歌 | 无 |
-| previous_song | 上一首歌 | 无 |
-| set_volume | 设置音量 | volume（0-100） |
-| add_to_playlist | 添加到播放列表 | song_id, song_name, artist |
-| get_playlist | 获取播放列表 | 无 |
-| clear_playlist | 清空播放列表 | 无 |
+| 工具 | 功能 |
+|---|---|
+| `resolve_music_url` | 将白名单测试音频解析为直链，并返回 EchoEar 设备工具所需参数 |
 
-## 技术架构
+## 当前限制
 
-- **协议**: MCP (Model Context Protocol)
-- **传输**: stdio（标准输入输出）
-- **语言**: Python 3.8+
-- **依赖**: mcp, httpx, pydantic
+- 仅开放乐鑫官方 MP3 测试音频，不提供商业歌曲目录。
+- EchoEar 的 URL 播放仍可能经过 Nologo 在线音乐后台，并受设备端 `config_music_player_enabled`、账号或名额限制。
+- 后续接入真实音乐服务时，只扩展解析器即可；设备播放工具保持不变。
 
-## 扩展开发
+## 安全说明
 
-### 接入真实音乐API
-
-当前版本使用模拟数据，您可以修改 `search_music_api` 函数来接入真实的免费音乐API：
-
-```python
-async def search_music_api(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    async with httpx.AsyncClient() as client:
-        # 接入您选择的免费音乐API
-        response = await client.get(
-            "https://api.example.com/search",
-            params={"q": query, "limit": limit}
-        )
-        data = response.json()
-        return parse_search_results(data)
-```
-
-### 添加新功能
-
-1. 在 `handle_list_tools()` 中添加新工具定义
-2. 在 `handle_call_tool()` 中实现工具逻辑
-3. 更新配置文件和文档
-
-## 故障排除
-
-### 常见问题
-
-**Q: 服务器启动失败**
-A: 检查Python版本和依赖包是否正确安装
-
-**Q: 小智AI无法连接**
-A: 确认文件路径正确，检查MCP接入点配置
-
-**Q: 搜索无结果**
-A: 当前使用模拟数据，可接入真实音乐API
-
-### 调试模式
-
-启用详细日志：
-```bash
-PYTHON_LOG_LEVEL=DEBUG python3 music_mcp_server.py
-```
-
-## 许可证
-
-本项目基于MIT许可证开源，您可以自由使用、修改和分发。
-
-## 贡献
-
-欢迎提交Issue和Pull Request来改进这个项目！
-
----
-
-**注意**: 请确保遵守相关音乐版权法律法规，仅使用合法的音乐资源。
+- `MCP_ENDPOINT` 中的 Token 相当于凭据，不要上传、截图或写进日志。
+- 桥接程序输出地址时会隐藏查询参数中的 Token。
+- 如果 Token 曾提交到公开仓库，仅删除当前文件不够；还应撤销 Token，并按需要清理 Git 历史。

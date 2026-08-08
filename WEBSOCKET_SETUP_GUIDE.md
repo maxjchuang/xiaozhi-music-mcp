@@ -1,3 +1,7 @@
+# ⚠️ 旧版入站 WebSocket 指南
+
+> 小智 MCP 接入点需要本项目主动连接，不能把 `ws://localhost:8765` 配给小智云端。请以 [README.md](README.md) 为准。
+
 # 免费音乐MCP WebSocket服务器 - 小智AI接入指南
 
 ## 🎵 项目概述
