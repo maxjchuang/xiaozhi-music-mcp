@@ -2,7 +2,7 @@
 
 这是一个运行在个人电脑或云主机上的小智外部 MCP 服务。程序通过小智控制台提供的 WebSocket 接入点主动连接小智云端，为 EchoEar（喵伴）的设备端在线音乐工具搜索歌曲并生成局域网播放地址。
 
-音乐源严格按 `Navidrome → Jamendo → 可选非官方适配器` 的顺序降级。真正的播放仍由 EchoEar 固件内置的 `self.online_music.play_music` 执行。
+音乐源严格按 `Navidrome → 网易云（账号授权）→ Jamendo → 可选非官方适配器` 的顺序降级。真正的播放仍由 EchoEar 固件内置的 `self.online_music.play_music` 执行。
 
 ## 工作方式
 
@@ -64,7 +64,7 @@ JAMENDO_CLIENT_ID=你的ClientID
 
 当前 EchoEar 测试固件固定允许端口 `8765`，请勿修改该值。
 
-至少配置 Navidrome 或 Jamendo 中的一个。非官方适配器默认关闭；详细配置见 [PROVIDERS.md](PROVIDERS.md)。乐鑫官方测试音频作为诊断入口始终保留，不依赖音乐源配置。
+至少配置 Navidrome、网易云或 Jamendo 中的一个。网易云和非官方适配器默认关闭；详细配置见 [PROVIDERS.md](PROVIDERS.md)。乐鑫官方测试音频作为诊断入口始终保留，不依赖音乐源配置。
 
 `.env` 已加入 `.gitignore`。
 
@@ -129,7 +129,7 @@ python test_mcp_pipe.py
 
 ## 当前限制
 
-- Navidrome 只管理用户自己的音乐文件；Jamendo 以独立音乐为主。
+- Navidrome 只管理用户自己的音乐文件；网易云 Provider 接受平台原生完整歌曲或官方试听 URL；Jamendo 以独立音乐为主。
 - 非官方适配器默认关闭，稳定性、账号权限和内容合规性由适配器使用者负责。
 - EchoEar 与运行 MCP 的电脑必须在同一局域网，且本机防火墙需允许 Python 接收 TCP 8765 端口的局域网连接。
 - EchoEar 的 URL 播放仍可能经过 Nologo 在线音乐后台，并受设备端 `config_music_player_enabled`、账号或名额限制。
@@ -138,6 +138,6 @@ python test_mcp_pipe.py
 ## 安全说明
 
 - `MCP_ENDPOINT` 中的 Token 相当于凭据，不要上传、截图或写进日志。
-- Navidrome 密码、Jamendo Client ID 和非官方适配器令牌只放在 `.env`，不要提交到 Git。
+- Navidrome 密码、网易云 Cookie、Jamendo Client ID 和非官方适配器令牌只放在本地环境文件，不要提交到 Git。
 - 桥接程序输出地址时会隐藏查询参数中的 Token。
 - 如果 Token 曾提交到公开仓库，仅删除当前文件不够；还应撤销 Token，并按需要清理 Git 历史。

@@ -17,6 +17,7 @@ from music_providers import ProviderChain, Track, providers_from_env
 
 
 mcp = FastMCP("xiaozhi-music-resolver")
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 20.0
 OFFICIAL_TEST_TRACK = Track(
     provider="diagnostic",
     track_id="espressif-stereo-44100",
@@ -36,6 +37,15 @@ TEST_ALIASES = (
 
 def _normalize(value: str) -> str:
     return "".join(value.casefold().split())
+
+
+def provider_timeout_seconds() -> float:
+    raw_value = os.getenv("MUSIC_PROVIDER_TIMEOUT_SECONDS", "20").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return DEFAULT_PROVIDER_TIMEOUT_SECONDS
+    return value if 1 <= value <= 60 else DEFAULT_PROVIDER_TIMEOUT_SECONDS
 
 
 def resolve_diagnostic_track(query: str) -> Track | None:
@@ -110,7 +120,7 @@ async def resolve_music_url(
         Field(min_length=1, description="歌曲名，可同时包含歌手名，例如：海阔天空 Beyond"),
     ],
 ) -> str:
-    """按本地 Navidrome、Jamendo、可选非官方源的顺序解析歌曲。
+    """按本地 Navidrome、受限网易云、Jamendo、可选非官方源的顺序解析歌曲。
 
     本工具只解析 URL，不播放音频。成功后必须继续调用设备端工具
     `self.online_music.play_music`，并原样使用返回的 `device_arguments`。
@@ -130,7 +140,7 @@ async def resolve_music_url(
             ensure_ascii=False,
         )
 
-    track, failures = await ProviderChain(providers).search(query)
+    track, failures = await ProviderChain(providers, timeout=provider_timeout_seconds()).search(query)
     if track is None:
         return json.dumps(
             {

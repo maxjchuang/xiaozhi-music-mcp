@@ -35,6 +35,7 @@ class Track:
     duration: int | None = None
     content_type: str = "audio/mpeg"
     artwork_url: str = ""
+    is_preview: bool = False
 
     def public_dict(self) -> dict[str, Any]:
         """Return metadata safe to expose to the assistant and logs."""
@@ -75,6 +76,14 @@ def _optional_int(value: object) -> int | None:
         return int(float(str(value)))
     except ValueError:
         return None
+
+
+def _timeout_from_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip())
+    except ValueError:
+        return default
+    return value if 1 <= value <= 60 else default
 
 
 class NavidromeProvider:
@@ -187,6 +196,93 @@ class JamendoProvider:
         return tracks
 
 
+class NeteaseProvider:
+    """Search a self-hosted NetEase API and return native playable URLs.
+
+    This client never requests the API's ``unblock`` modes. Tracks without a
+    platform-provided URL are treated as unavailable. Official preview URLs are
+    accepted and marked in public metadata.
+    """
+
+    name = "netease"
+
+    def __init__(self, base_url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS):
+        self.base_url = base_url.rstrip("/") + "/"
+        self.timeout = timeout
+
+    def _api_url(self, path: str, **params: object) -> str:
+        return urljoin(self.base_url, path.lstrip("/")) + "?" + urlencode(
+            {key: str(value) for key, value in params.items()}
+        )
+
+    async def search(self, query: str, limit: int = 5) -> list[Track]:
+        result_limit = max(1, min(limit, 10))
+        search_url = self._api_url(
+            "cloudsearch",
+            keywords=query,
+            type=1,
+            limit=result_limit,
+        )
+        payload = await asyncio.to_thread(_get_json, search_url, self.timeout)
+        if not isinstance(payload, dict) or payload.get("code") != 200:
+            raise ProviderError("NetEase search request failed")
+        songs = payload.get("result", {}).get("songs", [])
+        if not isinstance(songs, list):
+            raise ProviderError("NetEase search returned an invalid payload")
+
+        tracks: list[Track] = []
+        for song in songs[:result_limit]:
+            if not isinstance(song, dict):
+                continue
+            track_id = str(song.get("id", "")).strip()
+            title = str(song.get("name", "")).strip()
+            if not track_id or not title:
+                continue
+
+            stream_url = self._api_url(
+                "song/url/v1",
+                id=track_id,
+                level="standard",
+            )
+            stream_payload = await asyncio.to_thread(_get_json, stream_url, self.timeout)
+            stream_items = stream_payload.get("data", []) if isinstance(stream_payload, dict) else []
+            stream = stream_items[0] if isinstance(stream_items, list) and stream_items else {}
+            if not isinstance(stream, dict):
+                continue
+            audio_url = str(stream.get("url") or "").strip()
+            if not audio_url or urlsplit(audio_url).scheme not in {"http", "https"}:
+                continue
+
+            artists = song.get("ar", [])
+            artist = "/".join(
+                str(item.get("name", "")).strip()
+                for item in artists
+                if isinstance(item, dict) and item.get("name")
+            )
+            album = song.get("al", {})
+            audio_type = str(stream.get("type", "mp3")).lower()
+            duration_ms = _optional_int(song.get("dt"))
+            tracks.append(
+                Track(
+                    provider=self.name,
+                    track_id=track_id,
+                    title=title,
+                    artist=artist or "未知歌手",
+                    album=str(album.get("name", "")) if isinstance(album, dict) else "",
+                    duration=duration_ms // 1000 if duration_ms else None,
+                    content_type="audio/flac" if audio_type == "flac" else "audio/mpeg",
+                    artwork_url=str(album.get("picUrl", "")) if isinstance(album, dict) else "",
+                    audio_url=audio_url,
+                    is_preview=stream.get("freeTrialInfo") is not None,
+                )
+            )
+            # ProviderChain consumes only the first playable result. Returning
+            # immediately avoids resolving up to nine unused stream URLs and
+            # keeps voice requests comfortably inside the provider timeout.
+            return tracks
+        return tracks
+
+
 class HttpJsonProvider:
     """Adapter for an optional user-managed unofficial aggregation service.
 
@@ -246,9 +342,18 @@ class ProviderChain:
         for provider in self.providers:
             try:
                 tracks = await asyncio.wait_for(provider.search(query, limit), timeout=self.timeout)
-            except (asyncio.TimeoutError, ProviderError, OSError) as exc:
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "音乐源 %s 搜索超时（query=%r timeout=%.1fs）",
+                    provider.name,
+                    query,
+                    self.timeout,
+                )
+                failures.append({"provider": provider.name, "reason": "timeout"})
+                continue
+            except (ProviderError, OSError) as exc:
                 LOGGER.warning("音乐源 %s 搜索失败：%s", provider.name, exc)
-                failures.append({"provider": provider.name, "reason": str(exc) or "timeout"})
+                failures.append({"provider": provider.name, "reason": str(exc)})
                 continue
             if tracks:
                 return tracks[0], failures
@@ -269,6 +374,12 @@ def providers_from_env() -> list[MusicProvider]:
         )
     if client_id := os.getenv("JAMENDO_CLIENT_ID", "").strip():
         available["jamendo"] = JamendoProvider(client_id)
+    if os.getenv("NETEASE_PROVIDER_ENABLED", "false").strip().lower() in {"1", "true", "yes"}:
+        if endpoint := os.getenv("NETEASE_API_URL", "").strip():
+            available["netease"] = NeteaseProvider(
+                endpoint,
+                timeout=_timeout_from_env("NETEASE_API_TIMEOUT_SECONDS", 12.0),
+            )
     if os.getenv("UNOFFICIAL_PROVIDER_ENABLED", "false").strip().lower() in {"1", "true", "yes"}:
         if endpoint := os.getenv("UNOFFICIAL_PROVIDER_URL", "").strip():
             available["unofficial"] = HttpJsonProvider(
@@ -276,6 +387,6 @@ def providers_from_env() -> list[MusicProvider]:
                 os.getenv("UNOFFICIAL_PROVIDER_TOKEN", "").strip(),
             )
 
-    requested = os.getenv("MUSIC_PROVIDER_ORDER", "navidrome,jamendo,unofficial")
+    requested = os.getenv("MUSIC_PROVIDER_ORDER", "navidrome,netease,jamendo,unofficial")
     order = [item.strip().lower() for item in requested.split(",") if item.strip()]
     return [available[name] for name in order if name in available]
