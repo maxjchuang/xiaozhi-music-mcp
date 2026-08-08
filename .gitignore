@@ -28,6 +28,7 @@ ENV/
 
 # Local secrets
 .env
+.env.local
 logs/
 
 # IDE

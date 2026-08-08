@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
-"""Resolve approved audio URLs for EchoEar's device-side music MCP tool."""
+"""Resolve music through prioritized providers for EchoEar playback."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Annotated, Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastmcp import FastMCP
 from pydantic import Field
 
+from music_providers import ProviderChain, Track, providers_from_env
+
 
 mcp = FastMCP("xiaozhi-music-resolver")
-
-# Keep the first end-to-end test deterministic and copyright-safe. This file is
-# hosted by Espressif and is used as an HTTP/MP3 playback test asset.
-TEST_TRACKS: tuple[dict[str, Any], ...] = (
-    {
-        "id": "espressif-stereo-44100",
-        "title": "乐鑫官方立体声测试音频",
-        "artist": "Espressif",
-        "audio_url": "https://dl.espressif.com/dl/audio/ff-16b-2c-44100hz.mp3",
-        "content_type": "audio/mpeg",
-        "aliases": (
-            "乐鑫官方测试音频",
-            "乐鑫测试音频",
-            "官方测试音频",
-            "测试音频",
-            "测试歌曲",
-            "espressif test audio",
-        ),
-    },
+OFFICIAL_TEST_TRACK = Track(
+    provider="diagnostic",
+    track_id="espressif-stereo-44100",
+    title="乐鑫官方立体声测试音频",
+    artist="Espressif",
+    audio_url="https://dl.espressif.com/dl/audio/ff-16b-2c-44100hz.mp3",
+)
+TEST_ALIASES = (
+    "乐鑫官方测试音频",
+    "乐鑫测试音频",
+    "官方测试音频",
+    "测试音频",
+    "测试歌曲",
+    "espressif test audio",
 )
 
 
@@ -38,68 +38,123 @@ def _normalize(value: str) -> str:
     return "".join(value.casefold().split())
 
 
-def resolve_track(query: str) -> dict[str, Any] | None:
-    """Resolve a query against the deliberately small approved catalogue."""
-    normalized_query = _normalize(query)
-    if not normalized_query:
-        return None
-
-    for track in TEST_TRACKS:
-        candidates = (track["title"], track["artist"], *track["aliases"])
-        if any(
-            _normalize(candidate) in normalized_query
-            or normalized_query in _normalize(candidate)
-            for candidate in candidates
-        ):
-            return track
+def resolve_diagnostic_track(query: str) -> Track | None:
+    normalized = _normalize(query)
+    candidates = (OFFICIAL_TEST_TRACK.title, *TEST_ALIASES)
+    if any(_normalize(item) in normalized or normalized in _normalize(item) for item in candidates):
+        return OFFICIAL_TEST_TRACK
     return None
+
+
+def _register_proxy_sync(track: Track) -> str:
+    register_url = os.getenv("MUSIC_PROXY_REGISTER_URL", "").strip()
+    register_token = os.getenv("MUSIC_PROXY_REGISTER_TOKEN", "").strip()
+    if not register_url:
+        return track.audio_url
+
+    body = json.dumps(
+        {
+            "url": track.audio_url,
+            "content_type": track.content_type,
+            "title": track.title,
+        }
+    ).encode("utf-8")
+    request = Request(
+        register_url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {register_token}",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+    )
+    try:
+        with urlopen(request, timeout=3) as response:
+            payload = json.load(response)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+        raise RuntimeError(f"无法登记局域网播放地址：{exc}") from exc
+    public_url = str(payload.get("url", "")).strip()
+    if not public_url:
+        raise RuntimeError("音频代理没有返回播放地址")
+    return public_url
+
+
+async def register_proxy(track: Track) -> str:
+    return await asyncio.to_thread(_register_proxy_sync, track)
+
+
+def _success_payload(track: Track, audio_url: str, failures: list[dict[str, str]]) -> str:
+    return json.dumps(
+        {
+            "success": True,
+            **track.public_dict(),
+            "audio_url": audio_url,
+            "fallback_failures": failures,
+            "next_step": "立即调用设备端 MCP 工具 self.online_music.play_music",
+            "device_tool": "self.online_music.play_music",
+            "device_arguments": {
+                "play_type": "url",
+                "url": audio_url,
+                "url_song_name": f"{track.title} - {track.artist}",
+            },
+        },
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()
 async def resolve_music_url(
     query: Annotated[
         str,
-        Field(
-            min_length=1,
-            description="要解析的歌曲或测试音频名称，例如：乐鑫官方测试音频",
-        ),
+        Field(min_length=1, description="歌曲名，可同时包含歌手名，例如：海阔天空 Beyond"),
     ],
 ) -> str:
-    """解析白名单音频的直链。
+    """按本地 Navidrome、Jamendo、可选非官方源的顺序解析歌曲。
 
     本工具只解析 URL，不播放音频。成功后必须继续调用设备端工具
     `self.online_music.play_music`，并原样使用返回的 `device_arguments`。
     不要改用官方 `play_music`、`search_music` 或 `self.music.play_song`。
     """
-    track = resolve_track(query)
-    if track is None:
+    if diagnostic := resolve_diagnostic_track(query):
+        return _success_payload(diagnostic, await register_proxy(diagnostic), [])
+
+    providers = providers_from_env()
+    if not providers:
         return json.dumps(
             {
                 "success": False,
-                "message": "当前仅开放乐鑫官方测试音频，请让用户说“播放乐鑫官方测试音频”。",
-                "available_tracks": [item["title"] for item in TEST_TRACKS],
+                "message": "尚未配置音乐源，请配置 Navidrome 或 Jamendo。",
+                "provider_order": ["navidrome", "jamendo", "unofficial"],
             },
             ensure_ascii=False,
         )
 
-    audio_url = os.getenv("MUSIC_PROXY_URL", "").strip() or track["audio_url"]
-    return json.dumps(
-        {
-            "success": True,
-            "title": track["title"],
-            "artist": track["artist"],
-            "audio_url": audio_url,
-            "content_type": track["content_type"],
-            "next_step": "立即调用设备端 MCP 工具 self.online_music.play_music",
-            "device_tool": "self.online_music.play_music",
-            "device_arguments": {
-                "play_type": "url",
-                "url": audio_url,
-                "url_song_name": track["title"],
+    track, failures = await ProviderChain(providers).search(query)
+    if track is None:
+        return json.dumps(
+            {
+                "success": False,
+                "message": f"没有找到可播放的歌曲：{query}",
+                "searched_providers": [provider.name for provider in providers],
+                "fallback_failures": failures,
             },
-        },
-        ensure_ascii=False,
-    )
+            ensure_ascii=False,
+        )
+
+    try:
+        audio_url = await register_proxy(track)
+    except RuntimeError as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "message": str(exc),
+                "provider": track.provider,
+                "title": track.title,
+            },
+            ensure_ascii=False,
+        )
+    return _success_payload(track, audio_url, failures)
 
 
 if __name__ == "__main__":
