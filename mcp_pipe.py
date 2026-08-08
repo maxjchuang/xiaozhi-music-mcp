@@ -4,16 +4,20 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import ssl
 import sys
 import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit, urlunsplit
@@ -25,8 +29,56 @@ import websockets
 LOGGER = logging.getLogger("xiaozhi-mcp-pipe")
 INITIAL_BACKOFF_SECONDS = 1
 MAX_BACKOFF_SECONDS = 60
-OFFICIAL_TEST_AUDIO_URL = "https://dl.espressif.com/dl/audio/ff-16b-2c-44100hz.mp3"
-PROXY_PATH = "/official-test.mp3"
+REGISTER_PATH = "/_register"
+STREAM_PREFIX = "/stream/"
+MAX_REGISTER_BODY = 16 * 1024
+MAX_REGISTERED_STREAMS = 256
+
+
+@dataclass(frozen=True, slots=True)
+class StreamSource:
+    url: str
+    content_type: str
+    title: str
+    expires_at: float
+
+
+class AudioProxyServer(ThreadingHTTPServer):
+    """Threading server carrying an in-memory, short-lived stream registry."""
+
+    def __init__(self, address: tuple[str, int], public_base_url: str, register_token: str):
+        super().__init__(address, AudioProxyHandler)
+        self.public_base_url = public_base_url.rstrip("/")
+        self.register_token = register_token
+        self.stream_ttl = max(60, int(os.getenv("MUSIC_PROXY_STREAM_TTL", "1800")))
+        self.streams: dict[str, StreamSource] = {}
+        self.streams_lock = threading.Lock()
+
+    def register(self, url: str, content_type: str, title: str) -> str:
+        now = time.time()
+        token = secrets.token_urlsafe(18)
+        with self.streams_lock:
+            expired = [key for key, value in self.streams.items() if value.expires_at <= now]
+            for key in expired:
+                self.streams.pop(key, None)
+            if len(self.streams) >= MAX_REGISTERED_STREAMS:
+                oldest = min(self.streams, key=lambda key: self.streams[key].expires_at)
+                self.streams.pop(oldest, None)
+            self.streams[token] = StreamSource(
+                url=url,
+                content_type=content_type,
+                title=title,
+                expires_at=now + self.stream_ttl,
+            )
+        return f"{self.public_base_url}{STREAM_PREFIX}{token}"
+
+    def resolve(self, token: str) -> StreamSource | None:
+        with self.streams_lock:
+            source = self.streams.get(token)
+            if source is not None and source.expires_at <= time.time():
+                self.streams.pop(token, None)
+                return None
+            return source
 
 
 def upstream_ssl_context() -> ssl.SSLContext:
@@ -41,36 +93,88 @@ def upstream_ssl_context() -> ssl.SSLContext:
     return context
 
 
-class OfficialAudioProxyHandler(BaseHTTPRequestHandler):
-    """Expose only the approved Espressif test asset to the local network."""
+class AudioProxyHandler(BaseHTTPRequestHandler):
+    """Register upstreams locally and expose opaque stream URLs to the LAN."""
 
     protocol_version = "HTTP/1.1"
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path != PROXY_PATH:
+    @property
+    def proxy_server(self) -> AudioProxyServer:
+        return self.server  # type: ignore[return-value]
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path != REGISTER_PATH or self.client_address[0] not in {"127.0.0.1", "::1"}:
             self.send_error(404)
+            return
+
+        expected = f"Bearer {self.proxy_server.register_token}"
+        if not secrets.compare_digest(self.headers.get("Authorization", ""), expected):
+            self.send_error(401)
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400, "invalid content length")
+            return
+        if content_length <= 0 or content_length > MAX_REGISTER_BODY:
+            self.send_error(413)
+            return
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_error(400, "invalid json")
+            return
+        url = str(payload.get("url", "")).strip()
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.netloc or parts.username or parts.password:
+            self.send_error(400, "invalid upstream url")
+            return
+        content_type = str(payload.get("content_type", "audio/mpeg"))[:100]
+        title = str(payload.get("title", ""))[:200]
+        public_url = self.proxy_server.register(url, content_type, title)
+        body = json.dumps({"url": public_url}).encode("utf-8")
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if not self.path.startswith(STREAM_PREFIX):
+            self.send_error(404)
+            return
+        token = self.path.removeprefix(STREAM_PREFIX).split("?", 1)[0]
+        source = self.proxy_server.resolve(token)
+        if source is None:
+            self.send_error(404, "stream expired or unknown")
             return
 
         headers = {"User-Agent": "xiaozhi-music-mcp/1.0", "Accept": "audio/mpeg"}
         if range_header := self.headers.get("Range"):
             headers["Range"] = range_header
-        request = Request(OFFICIAL_TEST_AUDIO_URL, headers=headers)
+        request = Request(source.url, headers=headers)
         try:
             with urlopen(request, timeout=30, context=upstream_ssl_context()) as upstream:
                 self.send_response(upstream.status)
                 for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
                     if value := upstream.headers.get(name):
                         self.send_header(name, value)
+                if not upstream.headers.get("Content-Type"):
+                    self.send_header("Content-Type", source.content_type)
                 self.send_header("Connection", "close")
                 self.end_headers()
                 while chunk := upstream.read(64 * 1024):
                     self.wfile.write(chunk)
         except HTTPError as exc:
-            LOGGER.warning("官方测试音频上游返回 HTTP %s", exc.code)
+            LOGGER.warning("音频上游返回 HTTP %s（%s）", exc.code, source.title)
             self.send_error(502, "upstream HTTP error")
         except (URLError, TimeoutError, OSError) as exc:
-            LOGGER.warning("官方测试音频代理失败：%s", exc)
-            self.send_error(502, "upstream unavailable")
+            LOGGER.warning("音频代理失败（%s）：%s", source.title, exc)
+            try:
+                self.send_error(502, "upstream unavailable")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def log_message(self, message_format: str, *args: object) -> None:
         LOGGER.info("[audio-proxy] %s", message_format % args)
@@ -83,16 +187,18 @@ def discover_lan_ip() -> str:
         return str(probe.getsockname()[0])
 
 
-def start_audio_proxy() -> ThreadingHTTPServer:
+def start_audio_proxy() -> AudioProxyServer:
     port = int(os.getenv("MUSIC_PROXY_PORT", "8765"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), OfficialAudioProxyHandler)
-    server.daemon_threads = True
     lan_ip = discover_lan_ip()
-    proxy_url = f"http://{lan_ip}:{port}{PROXY_PATH}"
-    os.environ["MUSIC_PROXY_URL"] = proxy_url
+    public_base_url = f"http://{lan_ip}:{port}"
+    register_token = secrets.token_urlsafe(32)
+    server = AudioProxyServer(("0.0.0.0", port), public_base_url, register_token)
+    server.daemon_threads = True
+    os.environ["MUSIC_PROXY_REGISTER_URL"] = f"http://127.0.0.1:{port}{REGISTER_PATH}"
+    os.environ["MUSIC_PROXY_REGISTER_TOKEN"] = register_token
     thread = threading.Thread(target=server.serve_forever, name="audio-proxy", daemon=True)
     thread.start()
-    LOGGER.info("乐鑫官方测试音频局域网代理已启动：%s", proxy_url)
+    LOGGER.info("动态音乐局域网代理已启动：%s%s<临时令牌>", public_base_url, STREAM_PREFIX)
     return server
 
 
@@ -207,6 +313,7 @@ async def run_forever(endpoint: str, server_script: Path) -> None:
 
 def main() -> int:
     load_dotenv()
+    load_dotenv(Path(__file__).with_name(".env.local"), override=False)
     log_dir = Path(__file__).with_name("logs")
     log_dir.mkdir(exist_ok=True)
     logging.basicConfig(
