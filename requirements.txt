@@ -4,3 +4,4 @@ mcp>=1.20.0,<2
 pydantic>=2.0.0
 python-dotenv>=1.2.1
 websockets>=15.0.1
+curl-cffi>=0.13.0,<1

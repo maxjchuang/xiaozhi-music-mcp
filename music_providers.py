@@ -4,16 +4,21 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 from dataclasses import asdict, dataclass
 import hashlib
+from html import unescape
 import json
 import logging
 import os
+import re
 import secrets
 import ssl
 from typing import Any, Protocol
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.request import Request, urlopen
+
+from curl_cffi import requests as curl_requests
 
 
 LOGGER = logging.getLogger("xiaozhi-music-providers")
@@ -253,6 +258,18 @@ class NeteaseProvider:
             if not audio_url or urlsplit(audio_url).scheme not in {"http", "https"}:
                 continue
 
+            duration_ms = _optional_int(song.get("dt"))
+            stream_duration_ms = _optional_int(stream.get("time"))
+            has_trial_metadata = stream.get("freeTrialInfo") is not None or stream.get("trialInfo") is not None
+            has_truncated_duration = bool(
+                duration_ms
+                and stream_duration_ms
+                and stream_duration_ms + 1000 < duration_ms
+            )
+            if has_trial_metadata or has_truncated_duration:
+                LOGGER.info("跳过网易云试听歌曲：%s (id=%s)", title, track_id)
+                continue
+
             artists = song.get("ar", [])
             artist = "/".join(
                 str(item.get("name", "")).strip()
@@ -261,7 +278,6 @@ class NeteaseProvider:
             )
             album = song.get("al", {})
             audio_type = str(stream.get("type", "mp3")).lower()
-            duration_ms = _optional_int(song.get("dt"))
             tracks.append(
                 Track(
                     provider=self.name,
@@ -273,7 +289,6 @@ class NeteaseProvider:
                     content_type="audio/flac" if audio_type == "flac" else "audio/mpeg",
                     artwork_url=str(album.get("picUrl", "")) if isinstance(album, dict) else "",
                     audio_url=audio_url,
-                    is_preview=stream.get("freeTrialInfo") is not None,
                 )
             )
             # ProviderChain consumes only the first playable result. Returning
@@ -281,6 +296,132 @@ class NeteaseProvider:
             # keeps voice requests comfortably inside the provider timeout.
             return tracks
         return tracks
+
+
+def _parse_fangpi_search_results(html: str, base_url: str = "https://www.fangpi.net") -> list[dict[str, str]]:
+    """Extract unique public track pages from Fangpi's server-rendered search page."""
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    pattern = re.compile(
+        r'<a\b(?=[^>]*\bhref=["\'](?P<href>/music/\d+)["\'])(?=[^>]*\btitle=["\'](?P<title>.*?)["\'])[^>]*>',
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(html):
+        track_url = urljoin(base_url, unescape(match.group("href")))
+        if track_url in seen:
+            continue
+        seen.add(track_url)
+        label = unescape(match.group("title")).strip()
+        title, separator, artist = label.rpartition(" - ")
+        if not separator:
+            title, artist = label, "未知歌手"
+        results.append(
+            {
+                "id": track_url.rstrip("/").rsplit("/", 1)[-1],
+                "title": title.strip(),
+                "artist": artist.strip() or "未知歌手",
+                "url": track_url,
+            }
+        )
+    return results
+
+
+def _parse_fangpi_app_data(html: str) -> dict[str, Any]:
+    """Decode the JSON metadata embedded in a Fangpi track page."""
+    match = re.search(r"window\.appData\s*=\s*JSON\.parse\('((?:\\.|[^'])*)'\)", html, re.DOTALL)
+    if not match:
+        raise ProviderError("Fangpi track page did not contain appData")
+    try:
+        decoded = ast.literal_eval("'" + match.group(1) + "'")
+        payload = json.loads(decoded)
+    except (SyntaxError, ValueError, json.JSONDecodeError) as exc:
+        raise ProviderError("Fangpi track metadata was invalid") from exc
+    if not isinstance(payload, dict):
+        raise ProviderError("Fangpi track metadata was invalid")
+    return payload
+
+
+class FangpiProvider:
+    """Resolve public Fangpi search results to short-lived audio URLs."""
+
+    name = "fangpi"
+    base_url = "https://www.fangpi.net"
+
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT_SECONDS, cookie: str = "", user_agent: str = ""):
+        self.timeout = timeout
+        self.session = curl_requests.Session(impersonate="chrome")
+        self.headers = {
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+            "Referer": self.base_url + "/",
+        }
+        if cookie:
+            self.headers["Cookie"] = cookie
+        if user_agent:
+            self.headers["User-Agent"] = user_agent
+
+    def _get_text(self, url: str) -> str:
+        try:
+            response = self.session.get(url, headers=self.headers, timeout=self.timeout)
+            response.raise_for_status()
+            return response.text
+        except curl_requests.RequestsError as exc:
+            raise ProviderError(str(exc)) from exc
+
+    def _post_json(self, url: str, data: dict[str, str]) -> Any:
+        try:
+            response = self.session.post(
+                url,
+                data=data,
+                headers={**self.headers, "X-Requested-With": "XMLHttpRequest"},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except (curl_requests.RequestsError, ValueError) as exc:
+            raise ProviderError(str(exc)) from exc
+
+    def _search_sync(self, query: str, limit: int) -> list[Track]:
+        search_url = self.base_url + "/s/" + quote(query, safe="")
+        results = _parse_fangpi_search_results(self._get_text(search_url), self.base_url)
+        for result in results[: max(1, min(limit, 5))]:
+            try:
+                metadata = _parse_fangpi_app_data(self._get_text(result["url"]))
+                play_id = str(metadata.get("play_id") or "").strip()
+                if not play_id:
+                    continue
+                payload = self._post_json(
+                    self.base_url + "/member/common-play-url",
+                    {"id": play_id},
+                )
+                data = payload.get("data", {}) if isinstance(payload, dict) else {}
+                audio_url = str(data.get("url") or "").replace("\\/", "/").strip()
+                if urlsplit(audio_url).scheme not in {"http", "https"}:
+                    continue
+                duration_text = str(metadata.get("mp3_duration") or "")
+                duration_parts = [int(value) for value in re.findall(r"\d+", duration_text)]
+                duration = None
+                if len(duration_parts) == 2:
+                    duration = duration_parts[0] * 60 + duration_parts[1]
+                elif len(duration_parts) == 3:
+                    duration = duration_parts[0] * 3600 + duration_parts[1] * 60 + duration_parts[2]
+                return [
+                    Track(
+                        provider=self.name,
+                        track_id=str(metadata.get("mp3_id") or result["id"]),
+                        title=str(metadata.get("mp3_title") or result["title"]).strip(),
+                        artist=str(metadata.get("mp3_author") or result["artist"]).strip(),
+                        duration=duration,
+                        content_type="audio/mpeg",
+                        artwork_url=str(metadata.get("mp3_cover") or "").replace("\\/", "/"),
+                        audio_url=audio_url,
+                    )
+                ]
+            except ProviderError as exc:
+                LOGGER.info("Fangpi 候选歌曲解析失败：%s", exc)
+        return []
+
+    async def search(self, query: str, limit: int = 5) -> list[Track]:
+        return await asyncio.to_thread(self._search_sync, query, limit)
 
 
 class HttpJsonProvider:
@@ -380,6 +521,12 @@ def providers_from_env() -> list[MusicProvider]:
                 endpoint,
                 timeout=_timeout_from_env("NETEASE_API_TIMEOUT_SECONDS", 12.0),
             )
+    if os.getenv("FANGPI_PROVIDER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}:
+        available["fangpi"] = FangpiProvider(
+            timeout=_timeout_from_env("FANGPI_API_TIMEOUT_SECONDS", 10.0),
+            cookie=os.getenv("FANGPI_COOKIE", "").strip(),
+            user_agent=os.getenv("FANGPI_USER_AGENT", "").strip(),
+        )
     if os.getenv("UNOFFICIAL_PROVIDER_ENABLED", "false").strip().lower() in {"1", "true", "yes"}:
         if endpoint := os.getenv("UNOFFICIAL_PROVIDER_URL", "").strip():
             available["unofficial"] = HttpJsonProvider(
@@ -387,6 +534,6 @@ def providers_from_env() -> list[MusicProvider]:
                 os.getenv("UNOFFICIAL_PROVIDER_TOKEN", "").strip(),
             )
 
-    requested = os.getenv("MUSIC_PROVIDER_ORDER", "navidrome,netease,jamendo,unofficial")
+    requested = os.getenv("MUSIC_PROVIDER_ORDER", "navidrome,netease,fangpi,jamendo,unofficial")
     order = [item.strip().lower() for item in requested.split(",") if item.strip()]
     return [available[name] for name in order if name in available]

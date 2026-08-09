@@ -3,7 +3,7 @@
 服务端严格按照 `MUSIC_PROVIDER_ORDER` 顺序搜索，默认顺序为：
 
 ```text
-Navidrome → 网易云（账号授权）→ Jamendo → 非官方适配器
+Navidrome → 网易云完整歌曲 → Fangpi → Jamendo → 非官方适配器
 ```
 
 某个音乐源返回至少一首歌曲后立即停止搜索。只有无结果、超时或请求失败时才会继续下一个来源。
@@ -55,7 +55,7 @@ HOST=127.0.0.1
 ENABLE_GENERAL_UNBLOCK=false
 ```
 
-Provider 使用 `/cloudsearch` 搜索，随后按搜索顺序调用 `/song/url/v1` 请求 `standard` 音质，找到第一条可播放结果后立即返回。它不会发送 `unblock=true`，也不会调用 `/song/url/match`。网易云返回的原生完整歌曲和官方试听 URL 都可播放，试听结果会标记 `is_preview=true`；无 URL 的歌曲会继续检查下一条结果。
+Provider 使用 `/cloudsearch` 搜索，随后按搜索顺序调用 `/song/url/v1` 请求 `standard` 音质，找到第一条完整可播放结果后立即返回。它不会发送 `unblock=true`，也不会调用 `/song/url/match`。带 `freeTrialInfo` / `trialInfo` 的试听地址，以及返回时长明显短于歌曲时长的 30 秒截断地址都会被过滤，然后继续检查下一条结果。
 
 如需使用自己账号已获授权的内容，可把 `MUSIC_U=...` 形式的 Cookie 只保存在网易云 API 服务的本地环境文件中。不要把 Cookie 写入本项目、日志或设备 URL。
 
@@ -74,6 +74,32 @@ Provider 使用 `/cloudsearch` 搜索，随后按搜索顺序调用 `/song/url/v
 launchctl print gui/$(id -u)/com.xiaozhi.netease-api
 curl 'http://127.0.0.1:3000/cloudsearch?keywords=海阔天空&type=1&limit=1'
 ```
+
+## Fangpi（默认启用）
+
+Fangpi 通过公开网页搜索歌曲，再用歌曲页中的动态 `play_id` 获取短期音频地址。该源默认启用；网页允许匿名播放，但 Cloudflare 可能拒绝没有浏览器挑战状态的独立 Python 客户端：
+
+```dotenv
+FANGPI_PROVIDER_ENABLED=true
+FANGPI_API_TIMEOUT_SECONDS=10
+```
+
+如需关闭：
+
+```dotenv
+FANGPI_PROVIDER_ENABLED=false
+```
+
+普通会员登录态在实测中不会改变公开播放地址或音质，但登录浏览器已有的 Cloudflare 挑战 Cookie 可能是独立服务访问网页所必需的。如果日志出现 `Fangpi ... HTTP Error 403`，请从 Chrome 开发者工具的 Network 面板中，对一个 `fangpi.net` 请求使用“Copy as cURL”，仅提取其中的 `Cookie` 请求头并写入本机配置；切勿提交到 Git：
+
+```dotenv
+FANGPI_COOKIE=
+FANGPI_USER_AGENT=
+```
+
+`FANGPI_USER_AGENT` 应填写生成该 Cookie 时浏览器请求中的完整 `User-Agent`，否则 `cf_clearance` 仍可能被 Cloudflare 拒绝。
+
+Fangpi 没有公开 API，网页结构、Cloudflare 策略和第三方 CDN 地址都可能变化。实现使用浏览器兼容的 HTTP 客户端，解析后的音频地址会立即交给本服务的动态代理，不应长期缓存。
 
 ## 非官方适配器
 
