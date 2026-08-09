@@ -32,8 +32,35 @@ music_mcp_server.py（按优先级搜索歌曲）
 
 要求 Python 3.10 或更高版本。
 
+### 部署向导（推荐）
+
+在仓库目录运行一个命令：
+
 ```bash
-cd /Users/bytedance/Projects/github/xiaozhi-music-mcp
+bash scripts/deploy_wizard.sh
+```
+
+向导会依次完成：
+
+- 检查 Python 版本并创建 `.venv`；
+- 安装依赖；
+- 保留已有 `.env` / `.env.local`，缺少时创建配置并安全读取 `MCP_ENDPOINT`；
+- 固定 EchoEar 所需的音频代理端口 `8765`；
+- 运行 Provider、音频代理、标准 MCP 和 WebSocket 桥接测试；
+- 在 macOS 上可选择立即安装后台服务以及是否登录自启动。
+
+如已单独完成测试，可使用：
+
+```bash
+bash scripts/deploy_wizard.sh --skip-tests
+```
+
+向导不会安装或迁移 Navidrome、网易云 API 等独立服务，它们仍需按 [PROVIDERS.md](PROVIDERS.md) 配置。
+
+### 手动安装
+
+```bash
+cd xiaozhi-music-mcp
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -142,6 +169,152 @@ python mcp_pipe.py
 - “播放海阔天空 Beyond”（需要相应音乐源中存在该歌曲）
 
 前台运行时，停止服务请按 `Ctrl+C`。
+
+## 迁移到另一台电脑
+
+不需要修改 EchoEar 固件。新电脑通过 `MCP_ENDPOINT` 主动连接小智云端，但动态音频地址使用新电脑的局域网 IP，因此新电脑和 EchoEar 必须处于同一局域网。
+
+### 1. 切换前检查
+
+- 新电脑安装 Python 3.10 或更高版本，并保持开机、联网且不会自动睡眠；
+- 防火墙允许 Python 接收局域网 TCP `8765`；
+- 路由器没有开启客户端隔离；
+- 如果启用了 VPN，确认日志显示的是 EchoEar 可以访问的局域网 IPv4 地址；
+- 使用同一个 `MCP_ENDPOINT` 时，先停止旧电脑服务，避免两个桥接程序同时占用同一个接入点。
+
+推荐在小智控制台生成新的 MCP 接入点 Token，切换成功后撤销旧 Token。不要通过 Git、聊天记录或公开网盘迁移 Token 和 Cookie。
+
+### 2. 获取代码并迁移本地配置
+
+```bash
+git clone git@github.com:maxjchuang/xiaozhi-music-mcp.git
+cd xiaozhi-music-mcp
+```
+
+通过加密传输、隔空投送或其他可信方式，把旧电脑项目目录中的 `.env` 和 `.env.local` 复制到新电脑相同位置，然后限制权限：
+
+```bash
+chmod 600 .env .env.local
+bash scripts/deploy_wizard.sh
+```
+
+如果不迁移旧配置，部署向导会创建 `.env` 并要求输入新的 `MCP_ENDPOINT`，其他 Provider 按 `.env.example` 和 [PROVIDERS.md](PROVIDERS.md) 配置。
+
+### 3. 迁移网易云音乐服务
+
+启用网易云 Provider 时，新电脑还必须独立运行 `NeteaseCloudMusicApiEnhanced`：
+
+```bash
+mkdir -p ~/.local/share/xiaozhi
+cd ~/.local/share/xiaozhi
+git clone --filter=blob:none \
+  https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced.git \
+  netease-api-enhanced
+cd netease-api-enhanced
+npm install
+```
+
+其本地 `.env` 至少保持以下约束：
+
+```dotenv
+HOST=127.0.0.1
+PORT=3000
+ENABLE_GENERAL_UNBLOCK=false
+```
+
+网易云登录态保存在这个独立服务的 `.env` 中，而不是本仓库。可以安全迁移原来的 `NETEASE_COOKIE=MUSIC_U=...`，也可以在新电脑重新扫码登录。启动后先验证搜索接口：
+
+```bash
+cd ~/.local/share/xiaozhi/netease-api-enhanced
+npm start
+```
+
+保持该终端运行，并在另一个终端执行：
+
+```bash
+curl --fail --get \
+  --data-urlencode 'keywords=海阔天空 Beyond' \
+  --data 'type=1' \
+  --data 'limit=1' \
+  http://127.0.0.1:3000/cloudsearch
+```
+
+验证成功后，还需要用 macOS LaunchAgent、Linux `systemd` 或其他进程管理器让网易云 API 持续运行；只让主 MCP 服务常驻还不够。
+
+本仓库对应配置为：
+
+```dotenv
+NETEASE_PROVIDER_ENABLED=true
+NETEASE_API_URL=http://127.0.0.1:3000
+FANGPI_PROVIDER_ENABLED=false
+```
+
+Navidrome、Jamendo 和其他适配器只需迁移自己实际启用的配置。若 Navidrome 位于 NAS 或另一台电脑，`NAVIDROME_URL` 必须改成新电脑可以访问的地址，不能继续使用错误的 `127.0.0.1`。
+
+### 4. 接管服务
+
+先在旧电脑停止服务：
+
+```bash
+bash scripts/music_service.sh stop
+```
+
+然后在新电脑启动。macOS 推荐：
+
+```bash
+bash scripts/music_service.sh install
+bash scripts/music_service.sh status
+bash scripts/music_service.sh logs
+```
+
+Linux 可以先以前台方式验证：
+
+```bash
+source .venv/bin/activate
+python mcp_pipe.py
+```
+
+Windows 目前不支持 Bash 部署向导和 `music_service.sh`，可以在 PowerShell 中使用 `.venv\Scripts\python.exe mcp_pipe.py` 前台验证，再配置任务计划。当前 `music_service.sh` 只支持 macOS；其他系统验证成功后需自行配置 `systemd` 或任务计划。Docker 部署还需要确保返回给 EchoEar 的不是容器内部 IP，因此普通端口映射不适合作为首次迁移验证方式。
+
+### 5. 分层验证
+
+先验证本地代码，不连接小智也能执行：
+
+```bash
+source .venv/bin/activate
+python -m unittest -v test_music_providers.py test_audio_proxy.py
+python test_mcp.py
+python test_mcp_pipe.py
+```
+
+启动服务后，状态和日志应包含：
+
+```text
+运行状态：运行中
+音频代理：正在监听 TCP 8765
+小智 MCP 接入点连接成功
+已启动本地 MCP 服务
+动态音乐局域网代理已启动：http://新电脑局域网IP:8765/stream/<临时令牌>
+```
+
+可以从同一局域网的另一台电脑测试端口：
+
+```bash
+nc -vz 新电脑局域网IP 8765
+```
+
+最后进行两级设备验证：
+
+1. 对 EchoEar 说“播放乐鑫官方测试音频”，验证小智 MCP、局域网代理和设备 URL 播放链路；
+2. 再说“播放海阔天空 Beyond”，验证实际 Provider、账号权限、完整歌曲过滤和代理播放。
+
+成功时服务日志会出现来自设备的请求，例如：
+
+```text
+[audio-proxy] "GET /stream/... HTTP/1.1" 200
+```
+
+支持 HTTP Range 的播放请求也可能返回 `206`。如果控制台显示 MCP 在线但设备不能播放，优先检查日志中的代理 IP、TCP `8765` 防火墙以及两台设备是否确实处于同一局域网。
 
 ## 本地测试
 
