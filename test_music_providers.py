@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from music_providers import (
+    FangpiProvider,
     JamendoProvider,
     MusicProvider,
     NavidromeProvider,
@@ -16,6 +17,8 @@ from music_providers import (
     ProviderChain,
     ProviderError,
     Track,
+    _parse_fangpi_app_data,
+    _parse_fangpi_search_results,
     providers_from_env,
 )
 
@@ -136,11 +139,16 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("unblock", "".join(requested_urls))
         self.assertEqual(get_json.call_count, 2)
 
-    async def test_netease_accepts_and_marks_trial_stream(self) -> None:
+    async def test_netease_skips_trial_stream_and_returns_next_complete_song(self) -> None:
         responses = [
             {
                 "code": 200,
-                "result": {"songs": [{"id": 1, "name": "试听歌曲", "ar": [], "al": {}, "dt": 30000}]},
+                "result": {
+                    "songs": [
+                        {"id": 1, "name": "试听歌曲", "ar": [], "al": {}, "dt": 240000},
+                        {"id": 2, "name": "完整歌曲", "ar": [], "al": {}, "dt": 180000},
+                    ]
+                },
             },
             {
                 "code": 200,
@@ -148,17 +156,104 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "id": 1,
                         "url": "https://music.example/trial.mp3",
+                        "time": 30000,
                         "freeTrialInfo": {"start": 0, "end": 30},
+                    }
+                ],
+            },
+            {
+                "code": 200,
+                "data": [
+                    {
+                        "id": 2,
+                        "url": "https://music.example/full.mp3",
+                        "time": 180000,
+                        "freeTrialInfo": None,
                     }
                 ],
             },
         ]
         provider = NeteaseProvider("http://127.0.0.1:3000")
-        with patch("music_providers._get_json", side_effect=responses):
+        with patch("music_providers._get_json", side_effect=responses) as get_json:
             tracks = await provider.search("试听歌曲")
 
         self.assertEqual(len(tracks), 1)
-        self.assertTrue(tracks[0].is_preview)
+        self.assertEqual(tracks[0].track_id, "2")
+        self.assertEqual(tracks[0].audio_url, "https://music.example/full.mp3")
+        self.assertFalse(tracks[0].is_preview)
+        self.assertEqual(get_json.call_count, 3)
+
+    async def test_netease_filters_truncated_stream_without_trial_metadata(self) -> None:
+        responses = [
+            {
+                "code": 200,
+                "result": {"songs": [{"id": 1, "name": "短试听", "ar": [], "al": {}, "dt": 210000}]},
+            },
+            {
+                "code": 200,
+                "data": [{"id": 1, "url": "https://music.example/30s.mp3", "time": 30000}],
+            },
+        ]
+        provider = NeteaseProvider("http://127.0.0.1:3000")
+        with patch("music_providers._get_json", side_effect=responses):
+            tracks = await provider.search("短试听")
+
+        self.assertEqual(tracks, [])
+
+    async def test_fangpi_resolves_public_track_to_audio_url(self) -> None:
+        search_html = '''
+            <div class="card"><h1 class="mark">小苹果</h1>
+              <a href="/music/11599894" title="小苹果 - 筷子兄弟">歌曲</a>
+              <a class="btn" href="/music/11599894">播放&amp;下载</a>
+            </div>
+        '''
+        app_data = {
+            "mp3_id": 11599894,
+            "play_id": "encrypted-play-id",
+            "mp3_title": "小苹果",
+            "mp3_author": "筷子兄弟",
+            "mp3_duration": "03:33",
+            "mp3_cover": "https:\\/\\/img.example\\/cover.jpg",
+        }
+        encoded = repr(__import__("json").dumps(app_data, ensure_ascii=True))
+        detail_html = f"<script>window.appData = JSON.parse({encoded});</script>"
+        provider = FangpiProvider()
+        with (
+            patch.object(provider, "_get_text", side_effect=[search_html, detail_html]),
+            patch.object(
+                provider,
+                "_post_json",
+                return_value={"code": 1, "data": {"url": "https://cdn.example/song.mp3"}},
+            ) as post_json,
+        ):
+            tracks = await provider.search("小苹果")
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0].provider, "fangpi")
+        self.assertEqual(tracks[0].title, "小苹果")
+        self.assertEqual(tracks[0].artist, "筷子兄弟")
+        self.assertEqual(tracks[0].duration, 213)
+        self.assertEqual(tracks[0].audio_url, "https://cdn.example/song.mp3")
+        post_json.assert_called_once_with(
+            "https://www.fangpi.net/member/common-play-url",
+            {"id": "encrypted-play-id"},
+        )
+
+    def test_fangpi_html_parsers_reject_missing_metadata(self) -> None:
+        html = '<a href="/music/1" title="歌名 - 歌手">播放</a>'
+        self.assertEqual(
+            _parse_fangpi_search_results(html),
+            [
+                {
+                    "id": "1",
+                    "title": "歌名",
+                    "artist": "歌手",
+                    "url": "https://www.fangpi.net/music/1",
+                }
+            ],
+        )
+        with self.assertRaises(ProviderError):
+            _parse_fangpi_app_data("<html></html>")
 
     def test_environment_preserves_requested_priority(self) -> None:
         env = {
@@ -168,12 +263,22 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             "JAMENDO_CLIENT_ID": "j",
             "NETEASE_PROVIDER_ENABLED": "true",
             "NETEASE_API_URL": "http://localhost:3000",
+            "FANGPI_PROVIDER_ENABLED": "true",
             "UNOFFICIAL_PROVIDER_ENABLED": "true",
             "UNOFFICIAL_PROVIDER_URL": "http://localhost:9000/search",
-            "MUSIC_PROVIDER_ORDER": "navidrome,netease,jamendo,unofficial",
+            "MUSIC_PROVIDER_ORDER": "navidrome,netease,fangpi,jamendo,unofficial",
         }
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual([provider.name for provider in providers_from_env()], list(env["MUSIC_PROVIDER_ORDER"].split(",")))
+
+    def test_fangpi_is_enabled_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual([provider.name for provider in providers_from_env()], ["fangpi"])
+
+    def test_fangpi_accepts_manually_configured_cookie(self) -> None:
+        provider = FangpiProvider(cookie="session=test; cf_clearance=test", user_agent="Test Browser")
+        self.assertEqual(provider.headers["Cookie"], "session=test; cf_clearance=test")
+        self.assertEqual(provider.headers["User-Agent"], "Test Browser")
 
 
 if __name__ == "__main__":

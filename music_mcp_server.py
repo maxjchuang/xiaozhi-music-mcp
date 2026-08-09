@@ -134,8 +134,8 @@ async def resolve_music_url(
         return json.dumps(
             {
                 "success": False,
-                "message": "尚未配置音乐源，请配置 Navidrome 或 Jamendo。",
-                "provider_order": ["navidrome", "jamendo", "unofficial"],
+                "message": "尚未启用可用音乐源，请检查 Navidrome、网易云、Fangpi 或 Jamendo 配置。",
+                "provider_order": ["navidrome", "netease", "fangpi", "jamendo", "unofficial"],
             },
             ensure_ascii=False,
         )
