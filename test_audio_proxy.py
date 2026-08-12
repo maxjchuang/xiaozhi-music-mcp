@@ -13,7 +13,10 @@ from urllib.request import Request, urlopen
 
 from PIL import Image
 
-from mcp_pipe import AudioProxyServer, REGISTER_PATH
+from mcp_pipe import (
+    AudioProxyServer,
+    REGISTER_PATH,
+)
 
 
 AUDIO = b"ID3-test-audio"
@@ -117,6 +120,7 @@ class AudioProxyTests(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["title"], "测试歌曲")
         self.assertEqual(manifest["duration_ms"], 123000)
+        self.assertEqual(manifest["lyrics"]["offset_ms"], 0)
 
         with urlopen(manifest["lyrics"]["url"]) as response:
             self.assertEqual(response.read(), LYRICS)
@@ -124,6 +128,8 @@ class AudioProxyTests(unittest.TestCase):
             with urlopen(manifest["artwork"][key]) as response:
                 processed = Image.open(BytesIO(response.read()))
                 self.assertEqual(processed.size, expected_size)
+
+        self.assertNotIn("animation", manifest["artwork"])
 
 
 if __name__ == "__main__":

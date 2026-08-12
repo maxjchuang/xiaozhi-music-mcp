@@ -237,6 +237,7 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
     def _serve_manifest(self, token: str, source: StreamSource) -> None:
         artwork = None
         if source.artwork_url:
+            self._ensure_artwork(source)
             artwork = {
                 "background_url": self.proxy_server.media_url(token, "background.jpg"),
                 "disc_url": self.proxy_server.media_url(token, "disc.jpg"),
@@ -246,7 +247,7 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             lyrics = {
                 "url": self.proxy_server.media_url(token, "lyrics.lrc"),
                 "format": "lrc",
-                "offset_ms": 600,
+                "offset_ms": 0,
             }
         body = json.dumps(
             {
@@ -282,28 +283,32 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404, "artwork unavailable")
             return
         attribute = "background_jpeg" if background else "disc_jpeg"
+        if not self._ensure_artwork(source):
+            self.send_error(502, "artwork unavailable")
+            return
+        body = getattr(source, attribute)
+        self._send_bytes(body, "image/jpeg", cache=True)
+
+    def _ensure_artwork(self, source: StreamSource) -> bool:
         with source.assets_lock:
-            body = getattr(source, attribute)
-            if body is None:
-                try:
+            try:
+                if source.background_jpeg is None or source.disc_jpeg is None:
                     original, _ = _download_limited(source.artwork_url, MAX_IMAGE_BYTES, "image/*")
                     background_jpeg, disc_jpeg = _prepare_artwork(original)
                     source.background_jpeg = background_jpeg
                     source.disc_jpeg = disc_jpeg
-                    body = getattr(source, attribute)
-                except (
-                    HTTPError,
-                    URLError,
-                    TimeoutError,
-                    OSError,
-                    ValueError,
-                    UnidentifiedImageError,
-                    Image.DecompressionBombError,
-                ) as exc:
-                    LOGGER.warning("封面处理失败（%s）：%s", source.title, exc)
-                    self.send_error(502, "artwork unavailable")
-                    return
-        self._send_bytes(body, "image/jpeg", cache=True)
+                return True
+            except (
+                HTTPError,
+                URLError,
+                TimeoutError,
+                OSError,
+                ValueError,
+                UnidentifiedImageError,
+                Image.DecompressionBombError,
+            ) as exc:
+                LOGGER.warning("封面处理失败（%s）：%s", source.title, exc)
+                return False
 
     def _send_bytes(self, body: bytes, content_type: str, *, cache: bool = False) -> None:
         self.send_response(200)
@@ -364,10 +369,40 @@ def _download_limited(url: str, limit: int, accept: str) -> tuple[bytes, str]:
         return body, response.headers.get("Content-Type", "")
 
 
-def _jpeg_bytes(image: Image.Image, quality: int = 82) -> bytes:
+def _jpeg_bytes(image: Image.Image, quality: int = 92) -> bytes:
     output = BytesIO()
-    image.convert("RGB").save(output, format="JPEG", quality=quality, optimize=True)
+    image.convert("RGB").save(
+        output,
+        format="JPEG",
+        quality=quality,
+        subsampling=0,
+        optimize=True,
+    )
     return output.getvalue()
+
+
+def _dither_for_rgb565(image: Image.Image) -> Image.Image:
+    """Apply subtle ordered dithering before the device quantizes to RGB565."""
+    rgb = image.convert("RGB")
+    pixels = rgb.load()
+    # Centred Bayer 4x4 offsets. A small amplitude breaks up broad gradient
+    # bands without creating visible grain on the 360 px display.
+    bayer = (
+        (0, 8, 2, 10),
+        (12, 4, 14, 6),
+        (3, 11, 1, 9),
+        (15, 7, 13, 5),
+    )
+    for y in range(rgb.height):
+        for x in range(rgb.width):
+            red, green, blue = pixels[x, y]
+            offset = (bayer[y & 3][x & 3] - 7.5) * 0.55
+            pixels[x, y] = (
+                max(0, min(255, round(red + offset))),
+                max(0, min(255, round(green + offset * 0.55))),
+                max(0, min(255, round(blue + offset))),
+            )
+    return rgb
 
 
 def _prepare_artwork(body: bytes) -> tuple[bytes, bytes]:
@@ -378,10 +413,13 @@ def _prepare_artwork(body: bytes) -> tuple[bytes, bytes]:
             raise ValueError("artwork dimensions are too large")
         rgb = ImageOps.exif_transpose(decoded).convert("RGB")
         background = ImageOps.fit(rgb, (360, 360), method=Image.Resampling.LANCZOS)
-        background = background.filter(ImageFilter.GaussianBlur(radius=7))
-        background = ImageEnhance.Brightness(background).enhance(0.34)
+        background = background.filter(ImageFilter.GaussianBlur(radius=4))
+        background = ImageEnhance.Color(background).enhance(0.88)
+        background = ImageEnhance.Brightness(background).enhance(0.52)
+        background = _dither_for_rgb565(background)
         disc = ImageOps.fit(rgb, (192, 192), method=Image.Resampling.LANCZOS)
-        return _jpeg_bytes(background, 78), _jpeg_bytes(disc, 86)
+        disc = disc.filter(ImageFilter.UnsharpMask(radius=0.8, percent=65, threshold=3))
+        return _jpeg_bytes(background, 94), _jpeg_bytes(disc, 95)
 
 
 def discover_lan_ip() -> str:
