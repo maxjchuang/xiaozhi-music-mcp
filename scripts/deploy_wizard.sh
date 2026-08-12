@@ -158,7 +158,8 @@ printf '音频代理端口已固定为 8765。\n'
 if [[ "${skip_tests}" == "false" ]]; then
     info "运行本地测试"
     "${VENV_PYTHON}" -m unittest -v \
-        test_music_providers.py test_audio_proxy.py test_music_mcp_server.py
+        test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
+        test_provider_manager.py
     "${VENV_PYTHON}" test_mcp.py
     "${VENV_PYTHON}" test_mcp_pipe.py
 else

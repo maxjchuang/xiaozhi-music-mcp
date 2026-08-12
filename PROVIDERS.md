@@ -28,6 +28,16 @@ NAVIDROME_PASSWORD=请替换
 
 如果 Navidrome 运行在其他电脑或 NAS 上，`NAVIDROME_URL` 必须是运行本服务的电脑可以访问的地址。
 
+如果 Navidrome 安装在同一台 macOS 并希望由统一命令管理，增加：
+
+```dotenv
+NAVIDROME_SERVICE_MANAGED=true
+NAVIDROME_SERVICE_DIR=/你的/Navidrome/工作目录
+NAVIDROME_SERVICE_COMMAND=["navidrome","--configfile","/你的/navidrome.toml"]
+```
+
+命令必须是 JSON 字符串数组，不经 shell 解析；如果 Navidrome 已由 NAS、Docker 或 `brew services` 管理，请保持 `NAVIDROME_SERVICE_MANAGED=false`。
+
 ## Jamendo
 
 注册 Jamendo 开发者账号并创建应用，获得 Client ID：
@@ -46,6 +56,9 @@ JAMENDO_CLIENT_ID=请替换
 NETEASE_PROVIDER_ENABLED=true
 NETEASE_API_URL=http://127.0.0.1:3000
 NETEASE_API_TIMEOUT_SECONDS=12
+NETEASE_SERVICE_MANAGED=true
+NETEASE_SERVICE_DIR=~/.local/share/xiaozhi/netease-api-enhanced
+NETEASE_SERVICE_COMMAND=["npm","start"]
 ```
 
 API 服务必须仅监听 `127.0.0.1`，并固定配置：
@@ -64,14 +77,16 @@ Provider 使用 `/cloudsearch` 搜索，随后按搜索顺序调用 `/song/url/v
 ```text
 服务目录：~/.local/share/xiaozhi/netease-api-enhanced
 服务配置：~/.local/share/xiaozhi/netease-api-enhanced/.env
-开机自启：~/Library/LaunchAgents/com.xiaozhi.netease-api.plist
-运行日志：~/.local/state/xiaozhi/logs/netease-api.log
+统一托管：~/Library/LaunchAgents/com.xiaozhi.music-provider.netease.plist
+运行日志：~/.local/state/xiaozhi/logs/netease.log
 ```
+
+启用并指向本机地址时，`music_service.sh start` 默认自动拉起网易云服务。已有的 `com.xiaozhi.netease-api` 旧版 LaunchAgent 会被识别，并在下一次统一重启时平滑迁移。
 
 可用下面的命令查看状态：
 
 ```bash
-launchctl print gui/$(id -u)/com.xiaozhi.netease-api
+bash scripts/music_service.sh status
 curl 'http://127.0.0.1:3000/cloudsearch?keywords=海阔天空&type=1&limit=1'
 ```
 
@@ -109,6 +124,14 @@ Fangpi 没有公开 API，网页结构、Cloudflare 策略和第三方 CDN 地�
 UNOFFICIAL_PROVIDER_ENABLED=true
 UNOFFICIAL_PROVIDER_URL=http://127.0.0.1:9000/search
 UNOFFICIAL_PROVIDER_TOKEN=可选Bearer令牌
+```
+
+如果适配器也在本机并希望统一托管，增加：
+
+```dotenv
+UNOFFICIAL_SERVICE_MANAGED=true
+UNOFFICIAL_SERVICE_DIR=/适配器工作目录
+UNOFFICIAL_SERVICE_COMMAND=["node","server.js"]
 ```
 
 主服务会发送：
