@@ -10,12 +10,14 @@
 music_mcp_server.py（按优先级搜索歌曲）
         ↕ stdio
     mcp_pipe.py ↔ 小智云端 ↔ EchoEar 的 self.online_music.play_music（播放）
-        ↳ :8765/stream/<临时令牌>（动态音频代理）
+        ↳ :8765/media/<临时令牌>/audio（动态音频代理）
+        ↳ :8765/media/<临时令牌>/manifest.json（歌曲信息、封面与歌词）
 ```
 
 - `mcp_pipe.py` 主动连接 `MCP_ENDPOINT`，因此本地运行时不需要公网 IP 或端口映射。
 - `music_mcp_server.py` 是标准 FastMCP stdio 服务。
 - `mcp_pipe.py` 会在局域网启动动态音频代理，隐藏上游鉴权信息并解决部分 ESP32 无法直连 HTTPS/CDN 的问题；默认端口为 `8765`。
+- 新版代理会为每首歌生成短期媒体清单。封面按需裁剪为 360 × 360 暗化背景和 192 × 192 唱片；可用歌词以 LRC 转发。旧 `/stream/<令牌>` 地址仍兼容。
 - Provider 配置和非官方适配器协议见 [PROVIDERS.md](PROVIDERS.md)。
 - 电脑必须保持开机、联网，桥接程序必须持续运行。
 
@@ -149,7 +151,7 @@ python mcp_pipe.py
 连接小智 MCP 接入点：wss://api.xiaozhi.me/mcp/?token=***
 小智 MCP 接入点连接成功
 已启动本地 MCP 服务：.../music_mcp_server.py
-动态音乐局域网代理已启动：http://局域网IP:8765/stream/<临时令牌>
+动态音乐局域网代理已启动：http://局域网IP:8765/media/<临时令牌>/audio
 ```
 
 然后回到小智控制台刷新 MCP 接入点，应能看到在线状态和 1 个工具：`resolve_music_url`。小智不需要了解各个 Provider，来源选择由服务端完成。
@@ -162,6 +164,8 @@ python mcp_pipe.py
 解析成功后，必须立即调用设备端 MCP 工具 self.online_music.play_music，
 并原样使用 resolve_music_url 返回的 device_arguments。
 ```
+
+新版 EchoEar 固件会同时接收可选的 `device_arguments.metadata_url`，用于显示歌名、歌手、暗化封面、旋转唱片和三行同步歌词。旧固件和旧 URL 播放流程保持兼容。
 
 必要时重启小智设备，再尝试：
 
@@ -294,7 +298,7 @@ python test_mcp_pipe.py
 音频代理：正在监听 TCP 8765
 小智 MCP 接入点连接成功
 已启动本地 MCP 服务
-动态音乐局域网代理已启动：http://新电脑局域网IP:8765/stream/<临时令牌>
+动态音乐局域网代理已启动：http://新电脑局域网IP:8765/media/<临时令牌>/audio
 ```
 
 可以从同一局域网的另一台电脑测试端口：

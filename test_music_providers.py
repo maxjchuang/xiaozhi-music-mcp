@@ -125,6 +125,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ],
             },
+            {"code": 200, "lrc": {"lyric": "[00:01.00]海阔天空"}},
         ]
         provider = NeteaseProvider("http://127.0.0.1:3000")
         with patch("music_providers._get_json", side_effect=responses) as get_json:
@@ -137,7 +138,9 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/cloudsearch?", requested_urls[0])
         self.assertIn("/song/url/v1?", requested_urls[1])
         self.assertNotIn("unblock", "".join(requested_urls))
-        self.assertEqual(get_json.call_count, 2)
+        self.assertEqual(tracks[0].lyrics, "[00:01.00]海阔天空")
+        self.assertIn("/lyric?", requested_urls[2])
+        self.assertEqual(get_json.call_count, 3)
 
     async def test_netease_skips_trial_stream_and_returns_next_complete_song(self) -> None:
         responses = [
@@ -172,6 +175,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ],
             },
+            {"code": 200, "lrc": {"lyric": "[00:00.00]完整歌曲"}},
         ]
         provider = NeteaseProvider("http://127.0.0.1:3000")
         with patch("music_providers._get_json", side_effect=responses) as get_json:
@@ -181,7 +185,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracks[0].track_id, "2")
         self.assertEqual(tracks[0].audio_url, "https://music.example/full.mp3")
         self.assertFalse(tracks[0].is_preview)
-        self.assertEqual(get_json.call_count, 3)
+        self.assertEqual(get_json.call_count, 4)
 
     async def test_netease_filters_truncated_stream_without_trial_metadata(self) -> None:
         responses = [
