@@ -124,6 +124,8 @@ bash scripts/music_service.sh install
 
 默认选择 `N`：服务立即在 macOS LaunchAgent 中运行，关闭终端或退出 Codex 后仍会继续工作，但下次登录不会自动启动。选择 `Y` 则同时开启登录自启动。
 
+启动命令会读取当前 Provider 配置，先自动拉起需要本地进程的托管 Provider，再启动 MCP。停止、重启、状态、自启动切换和日志查看也会统一管理这些进程。网易云本机端点默认托管；Navidrome 或通用适配器只有显式配置 `*_SERVICE_MANAGED=true` 时才由本项目拉起。Fangpi 与 Jamendo 是远程 HTTP 来源，不会创建本地进程。
+
 日常管理命令：
 
 ```bash
@@ -243,17 +245,20 @@ curl --fail --get \
   http://127.0.0.1:3000/cloudsearch
 ```
 
-验证成功后，还需要用 macOS LaunchAgent、Linux `systemd` 或其他进程管理器让网易云 API 持续运行；只让主 MCP 服务常驻还不够。
+验证成功后，macOS 上可交给本项目的统一服务管理器持续运行；Linux 仍需使用 `systemd` 或其他进程管理器。
 
 本仓库对应配置为：
 
 ```dotenv
 NETEASE_PROVIDER_ENABLED=true
 NETEASE_API_URL=http://127.0.0.1:3000
+NETEASE_SERVICE_MANAGED=true
+NETEASE_SERVICE_DIR=~/.local/share/xiaozhi/netease-api-enhanced
+NETEASE_SERVICE_COMMAND=["npm","start"]
 FANGPI_PROVIDER_ENABLED=false
 ```
 
-Navidrome、Jamendo 和其他适配器只需迁移自己实际启用的配置。若 Navidrome 位于 NAS 或另一台电脑，`NAVIDROME_URL` 必须改成新电脑可以访问的地址，不能继续使用错误的 `127.0.0.1`。
+Navidrome、Jamendo 和其他适配器只需迁移自己实际启用的配置。若 Navidrome 位于 NAS 或另一台电脑，`NAVIDROME_URL` 必须改成新电脑可以访问的地址，不能继续使用错误的 `127.0.0.1`。本机 Navidrome 如需统一托管，可按 [PROVIDERS.md](PROVIDERS.md) 配置其服务目录和启动命令。
 
 ### 4. 接管服务
 
