@@ -40,12 +40,16 @@ class Track:
     duration: int | None = None
     content_type: str = "audio/mpeg"
     artwork_url: str = ""
+    lyrics: str = ""
+    lyrics_url: str = ""
     is_preview: bool = False
 
     def public_dict(self) -> dict[str, Any]:
         """Return metadata safe to expose to the assistant and logs."""
         value = asdict(self)
         value.pop("audio_url", None)
+        value.pop("lyrics", None)
+        value.pop("lyrics_url", None)
         return value
 
 
@@ -148,11 +152,43 @@ class NavidromeProvider:
                     album=str(song.get("album", "")),
                     duration=_optional_int(song.get("duration")),
                     content_type="audio/mpeg",
-                    artwork_url="",
+                    artwork_url=self._api_url("getCoverArt", id=str(song.get("coverArt", "")))
+                    if song.get("coverArt")
+                    else "",
+                    lyrics=await self._lyrics(track_id),
                     audio_url=self._api_url("stream", id=track_id, format="mp3", maxBitRate=192),
                 )
             )
+            return tracks
         return tracks
+
+    async def _lyrics(self, track_id: str) -> str:
+        """Return OpenSubsonic lyrics when the server implements the endpoint."""
+        try:
+            payload = await asyncio.to_thread(
+                _get_json,
+                self._api_url("getLyricsBySongId", id=track_id),
+                self.timeout,
+            )
+        except ProviderError:
+            return ""
+        root = payload.get("subsonic-response", {}) if isinstance(payload, dict) else {}
+        structured = root.get("lyricsList", {}).get("structuredLyrics", [])
+        if not isinstance(structured, list) or not structured:
+            return ""
+        lines = structured[0].get("line", []) if isinstance(structured[0], dict) else []
+        rendered: list[str] = []
+        for line in lines if isinstance(lines, list) else []:
+            if not isinstance(line, dict):
+                continue
+            text = str(line.get("value", "")).strip()
+            start = _optional_int(line.get("start"))
+            if not text or start is None:
+                continue
+            minutes, remainder = divmod(start, 60_000)
+            seconds, millis = divmod(remainder, 1000)
+            rendered.append(f"[{minutes:02d}:{seconds:02d}.{millis // 10:02d}]{text}")
+        return "\n".join(rendered)
 
 
 class JamendoProvider:
@@ -288,6 +324,7 @@ class NeteaseProvider:
                     duration=duration_ms // 1000 if duration_ms else None,
                     content_type="audio/flac" if audio_type == "flac" else "audio/mpeg",
                     artwork_url=str(album.get("picUrl", "")) if isinstance(album, dict) else "",
+                    lyrics=await self._lyrics(track_id),
                     audio_url=audio_url,
                 )
             )
@@ -296,6 +333,20 @@ class NeteaseProvider:
             # keeps voice requests comfortably inside the provider timeout.
             return tracks
         return tracks
+
+    async def _lyrics(self, track_id: str) -> str:
+        try:
+            payload = await asyncio.to_thread(
+                _get_json,
+                self._api_url("lyric", id=track_id),
+                self.timeout,
+            )
+        except ProviderError:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        lyric = payload.get("lrc", {}).get("lyric", "")
+        return str(lyric) if lyric else ""
 
 
 def _parse_fangpi_search_results(html: str, base_url: str = "https://www.fangpi.net") -> list[dict[str, str]]:
@@ -413,6 +464,7 @@ class FangpiProvider:
                         duration=duration,
                         content_type="audio/mpeg",
                         artwork_url=str(metadata.get("mp3_cover") or "").replace("\\/", "/"),
+                        lyrics=str(metadata.get("mp3_lyric") or metadata.get("lyric") or ""),
                         audio_url=audio_url,
                     )
                 ]
@@ -465,6 +517,8 @@ class HttpJsonProvider:
                     duration=_optional_int(item.get("duration")),
                     content_type=str(item.get("content_type", "audio/mpeg")),
                     artwork_url=str(item.get("artwork_url", "")),
+                    lyrics=str(item.get("lyrics") or item.get("lyric") or ""),
+                    lyrics_url=str(item.get("lyrics_url") or item.get("lyric_url") or ""),
                     audio_url=audio_url,
                 )
             )

@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -23,6 +24,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
 import websockets
 
 
@@ -31,16 +33,29 @@ INITIAL_BACKOFF_SECONDS = 1
 MAX_BACKOFF_SECONDS = 60
 REGISTER_PATH = "/_register"
 STREAM_PREFIX = "/stream/"
-MAX_REGISTER_BODY = 16 * 1024
+MEDIA_PREFIX = "/media/"
+MAX_REGISTER_BODY = 96 * 1024
 MAX_REGISTERED_STREAMS = 256
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_PIXELS = 4096 * 4096
+MAX_LYRICS_BYTES = 64 * 1024
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class StreamSource:
     url: str
     content_type: str
     title: str
     expires_at: float
+    artist: str = ""
+    album: str = ""
+    duration_ms: int | None = None
+    artwork_url: str = ""
+    lyrics: str = ""
+    lyrics_url: str = ""
+    background_jpeg: bytes | None = None
+    disc_jpeg: bytes | None = None
+    assets_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class AudioProxyServer(ThreadingHTTPServer):
@@ -54,7 +69,19 @@ class AudioProxyServer(ThreadingHTTPServer):
         self.streams: dict[str, StreamSource] = {}
         self.streams_lock = threading.Lock()
 
-    def register(self, url: str, content_type: str, title: str) -> str:
+    def register(
+        self,
+        url: str,
+        content_type: str,
+        title: str,
+        *,
+        artist: str = "",
+        album: str = "",
+        duration_ms: int | None = None,
+        artwork_url: str = "",
+        lyrics: str = "",
+        lyrics_url: str = "",
+    ) -> tuple[str, str]:
         now = time.time()
         token = secrets.token_urlsafe(18)
         with self.streams_lock:
@@ -69,8 +96,17 @@ class AudioProxyServer(ThreadingHTTPServer):
                 content_type=content_type,
                 title=title,
                 expires_at=now + self.stream_ttl,
+                artist=artist,
+                album=album,
+                duration_ms=duration_ms,
+                artwork_url=artwork_url,
+                lyrics=lyrics.encode("utf-8")[:MAX_LYRICS_BYTES].decode("utf-8", errors="ignore"),
+                lyrics_url=lyrics_url,
             )
-        return f"{self.public_base_url}{STREAM_PREFIX}{token}"
+        return (
+            f"{self.public_base_url}{MEDIA_PREFIX}{token}/audio",
+            f"{self.public_base_url}{MEDIA_PREFIX}{token}/manifest.json",
+        )
 
     def resolve(self, token: str) -> StreamSource | None:
         with self.streams_lock:
@@ -79,6 +115,9 @@ class AudioProxyServer(ThreadingHTTPServer):
                 self.streams.pop(token, None)
                 return None
             return source
+
+    def media_url(self, token: str, name: str) -> str:
+        return f"{self.public_base_url}{MEDIA_PREFIX}{token}/{name}"
 
 
 def upstream_ssl_context() -> ssl.SSLContext:
@@ -125,14 +164,32 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400, "invalid json")
             return
         url = str(payload.get("url", "")).strip()
-        parts = urlsplit(url)
-        if parts.scheme not in {"http", "https"} or not parts.netloc or parts.username or parts.password:
+        if not _valid_upstream_url(url):
             self.send_error(400, "invalid upstream url")
             return
         content_type = str(payload.get("content_type", "audio/mpeg"))[:100]
         title = str(payload.get("title", ""))[:200]
-        public_url = self.proxy_server.register(url, content_type, title)
-        body = json.dumps({"url": public_url}).encode("utf-8")
+        artwork_url = str(payload.get("artwork_url", "")).strip()
+        lyrics_url = str(payload.get("lyrics_url", "")).strip()
+        if artwork_url and not _valid_upstream_url(artwork_url):
+            artwork_url = ""
+        if lyrics_url and not _valid_upstream_url(lyrics_url):
+            lyrics_url = ""
+        duration_ms = payload.get("duration_ms")
+        if not isinstance(duration_ms, int) or duration_ms < 0:
+            duration_ms = None
+        public_url, metadata_url = self.proxy_server.register(
+            url,
+            content_type,
+            title,
+            artist=str(payload.get("artist", ""))[:200],
+            album=str(payload.get("album", ""))[:200],
+            duration_ms=duration_ms,
+            artwork_url=artwork_url,
+            lyrics=str(payload.get("lyrics", "")),
+            lyrics_url=lyrics_url,
+        )
+        body = json.dumps({"url": public_url, "metadata_url": metadata_url}).encode("utf-8")
         self.send_response(201)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -141,19 +198,134 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if not self.path.startswith(STREAM_PREFIX):
+        path = self.path.split("?", 1)[0]
+        if path.startswith(STREAM_PREFIX):
+            token = path.removeprefix(STREAM_PREFIX)
+            self._serve_audio(token)
+            return
+        if not path.startswith(MEDIA_PREFIX):
             self.send_error(404)
             return
-        token = self.path.removeprefix(STREAM_PREFIX).split("?", 1)[0]
+        parts = path.removeprefix(MEDIA_PREFIX).split("/", 1)
+        if len(parts) != 2:
+            self.send_error(404)
+            return
+        token, resource = parts
         source = self.proxy_server.resolve(token)
         if source is None:
             self.send_error(404, "stream expired or unknown")
             return
 
+        if resource == "audio":
+            self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
+        elif resource == "manifest.json":
+            self._serve_manifest(token, source)
+        elif resource == "lyrics.lrc":
+            self._serve_lyrics(source)
+        elif resource in {"background.jpg", "disc.jpg"}:
+            self._serve_artwork(source, background=resource == "background.jpg")
+        else:
+            self.send_error(404)
+
+    def _serve_audio(self, token: str) -> None:
+        source = self.proxy_server.resolve(token)
+        if source is None:
+            self.send_error(404, "stream expired or unknown")
+            return
+        self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
+
+    def _serve_manifest(self, token: str, source: StreamSource) -> None:
+        artwork = None
+        if source.artwork_url:
+            self._ensure_artwork(source)
+            artwork = {
+                "background_url": self.proxy_server.media_url(token, "background.jpg"),
+                "disc_url": self.proxy_server.media_url(token, "disc.jpg"),
+            }
+        lyrics = None
+        if source.lyrics or source.lyrics_url:
+            lyrics = {
+                "url": self.proxy_server.media_url(token, "lyrics.lrc"),
+                "format": "lrc",
+                "offset_ms": 0,
+            }
+        body = json.dumps(
+            {
+                "schema_version": 1,
+                "title": source.title,
+                "artist": source.artist,
+                "album": source.album,
+                "duration_ms": source.duration_ms,
+                "artwork": artwork,
+                "lyrics": lyrics,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self._send_bytes(body, "application/json; charset=utf-8")
+
+    def _serve_lyrics(self, source: StreamSource) -> None:
+        if source.lyrics:
+            body = source.lyrics.encode("utf-8")
+        elif source.lyrics_url:
+            try:
+                body, _ = _download_limited(source.lyrics_url, MAX_LYRICS_BYTES, "text/plain")
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                LOGGER.warning("歌词上游不可用（%s）：%s", source.title, exc)
+                self.send_error(502, "lyrics upstream unavailable")
+                return
+        else:
+            self.send_error(404, "lyrics unavailable")
+            return
+        self._send_bytes(body, "text/plain; charset=utf-8")
+
+    def _serve_artwork(self, source: StreamSource, *, background: bool) -> None:
+        if not source.artwork_url:
+            self.send_error(404, "artwork unavailable")
+            return
+        attribute = "background_jpeg" if background else "disc_jpeg"
+        if not self._ensure_artwork(source):
+            self.send_error(502, "artwork unavailable")
+            return
+        body = getattr(source, attribute)
+        self._send_bytes(body, "image/jpeg", cache=True)
+
+    def _ensure_artwork(self, source: StreamSource) -> bool:
+        with source.assets_lock:
+            try:
+                if source.background_jpeg is None or source.disc_jpeg is None:
+                    original, _ = _download_limited(source.artwork_url, MAX_IMAGE_BYTES, "image/*")
+                    background_jpeg, disc_jpeg = _prepare_artwork(original)
+                    source.background_jpeg = background_jpeg
+                    source.disc_jpeg = disc_jpeg
+                return True
+            except (
+                HTTPError,
+                URLError,
+                TimeoutError,
+                OSError,
+                ValueError,
+                UnidentifiedImageError,
+                Image.DecompressionBombError,
+            ) as exc:
+                LOGGER.warning("封面处理失败（%s）：%s", source.title, exc)
+                return False
+
+    def _send_bytes(self, body: bytes, content_type: str, *, cache: bool = False) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        if cache:
+            self.send_header("Cache-Control", "private, max-age=1800")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _proxy_upstream(self, url: str, content_type: str, title: str, *, allow_range: bool) -> None:
+
         headers = {"User-Agent": "xiaozhi-music-mcp/1.0", "Accept": "audio/mpeg"}
-        if range_header := self.headers.get("Range"):
+        if allow_range and (range_header := self.headers.get("Range")):
             headers["Range"] = range_header
-        request = Request(source.url, headers=headers)
+        request = Request(url, headers=headers)
         try:
             with urlopen(request, timeout=30, context=upstream_ssl_context()) as upstream:
                 self.send_response(upstream.status)
@@ -161,16 +333,16 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
                     if value := upstream.headers.get(name):
                         self.send_header(name, value)
                 if not upstream.headers.get("Content-Type"):
-                    self.send_header("Content-Type", source.content_type)
+                    self.send_header("Content-Type", content_type)
                 self.send_header("Connection", "close")
                 self.end_headers()
                 while chunk := upstream.read(64 * 1024):
                     self.wfile.write(chunk)
         except HTTPError as exc:
-            LOGGER.warning("音频上游返回 HTTP %s（%s）", exc.code, source.title)
+            LOGGER.warning("音频上游返回 HTTP %s（%s）", exc.code, title)
             self.send_error(502, "upstream HTTP error")
         except (URLError, TimeoutError, OSError) as exc:
-            LOGGER.warning("音频代理失败（%s）：%s", source.title, exc)
+            LOGGER.warning("音频代理失败（%s）：%s", title, exc)
             try:
                 self.send_error(502, "upstream unavailable")
             except (BrokenPipeError, ConnectionResetError):
@@ -178,6 +350,76 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, message_format: str, *args: object) -> None:
         LOGGER.info("[audio-proxy] %s", message_format % args)
+
+
+def _valid_upstream_url(url: str) -> bool:
+    parts = urlsplit(url)
+    return bool(parts.scheme in {"http", "https"} and parts.netloc and not parts.username and not parts.password)
+
+
+def _download_limited(url: str, limit: int, accept: str) -> tuple[bytes, str]:
+    request = Request(url, headers={"User-Agent": "xiaozhi-music-mcp/2.1", "Accept": accept})
+    with urlopen(request, timeout=10, context=upstream_ssl_context()) as response:
+        declared = response.headers.get("Content-Length")
+        if declared and int(declared) > limit:
+            raise ValueError("upstream resource is too large")
+        body = response.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError("upstream resource is too large")
+        return body, response.headers.get("Content-Type", "")
+
+
+def _jpeg_bytes(image: Image.Image, quality: int = 92) -> bytes:
+    output = BytesIO()
+    image.convert("RGB").save(
+        output,
+        format="JPEG",
+        quality=quality,
+        subsampling=0,
+        optimize=True,
+    )
+    return output.getvalue()
+
+
+def _dither_for_rgb565(image: Image.Image) -> Image.Image:
+    """Apply subtle ordered dithering before the device quantizes to RGB565."""
+    rgb = image.convert("RGB")
+    pixels = rgb.load()
+    # Centred Bayer 4x4 offsets. A small amplitude breaks up broad gradient
+    # bands without creating visible grain on the 360 px display.
+    bayer = (
+        (0, 8, 2, 10),
+        (12, 4, 14, 6),
+        (3, 11, 1, 9),
+        (15, 7, 13, 5),
+    )
+    for y in range(rgb.height):
+        for x in range(rgb.width):
+            red, green, blue = pixels[x, y]
+            offset = (bayer[y & 3][x & 3] - 7.5) * 0.55
+            pixels[x, y] = (
+                max(0, min(255, round(red + offset))),
+                max(0, min(255, round(green + offset * 0.55))),
+                max(0, min(255, round(blue + offset))),
+            )
+    return rgb
+
+
+def _prepare_artwork(body: bytes) -> tuple[bytes, bytes]:
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    with Image.open(BytesIO(body)) as decoded:
+        decoded.load()
+        if decoded.width * decoded.height > MAX_IMAGE_PIXELS:
+            raise ValueError("artwork dimensions are too large")
+        rgb = ImageOps.exif_transpose(decoded).convert("RGB")
+        background = ImageOps.fit(rgb, (360, 360), method=Image.Resampling.LANCZOS)
+        background = background.filter(ImageFilter.GaussianBlur(radius=4))
+        background = ImageEnhance.Color(background).enhance(0.88)
+        background = ImageEnhance.Brightness(background).enhance(0.52)
+        background = _dither_for_rgb565(background)
+        disc = ImageOps.fit(rgb, (192, 192), method=Image.Resampling.LANCZOS)
+        disc = disc.filter(ImageFilter.UnsharpMask(radius=0.8, percent=65, threshold=3))
+        return _jpeg_bytes(background, 94), _jpeg_bytes(disc, 95)
 
 
 def discover_lan_ip() -> str:
@@ -198,7 +440,7 @@ def start_audio_proxy() -> AudioProxyServer:
     os.environ["MUSIC_PROXY_REGISTER_TOKEN"] = register_token
     thread = threading.Thread(target=server.serve_forever, name="audio-proxy", daemon=True)
     thread.start()
-    LOGGER.info("动态音乐局域网代理已启动：%s%s<临时令牌>", public_base_url, STREAM_PREFIX)
+    LOGGER.info("动态音乐局域网代理已启动：%s%s<临时令牌>/audio", public_base_url, MEDIA_PREFIX)
     return server
 
 

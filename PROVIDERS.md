@@ -131,13 +131,15 @@ Authorization: Bearer <token>
       "duration": 240,
       "audio_url": "https://example.test/song.mp3",
       "content_type": "audio/mpeg",
-      "artwork_url": "https://example.test/cover.jpg"
+      "artwork_url": "https://example.test/cover.jpg",
+      "lyrics": "[00:01.00]第一句歌词",
+      "lyrics_url": "https://example.test/song.lrc"
     }
   ]
 }
 ```
 
-只有 `id`、`title`、`artist`、`audio_url` 是核心字段。`audio_url` 必须使用 HTTP 或 HTTPS。
+只有 `id`、`title`、`artist`、`audio_url` 是核心字段。`audio_url` 必须使用 HTTP 或 HTTPS。`lyrics` 和 `lyrics_url` 均为可选字段；同时提供时优先使用内联 `lyrics`。
 
 非官方音乐平台接口可能失效，并可能受账号、会员、地区、版权及平台服务条款约束。适配器应只访问用户有权播放的内容，并独立管理 Cookie；不要把 Cookie 或账号密码返回给本服务。
 
@@ -146,7 +148,8 @@ Authorization: Bearer <token>
 MCP 工具解析出歌曲后，会通过仅允许本机访问、带随机密钥的注册接口登记真实音频地址。EchoEar 收到的是类似下面的短期地址：
 
 ```text
-http://192.168.x.x:8765/stream/<随机令牌>
+http://192.168.x.x:8765/media/<随机令牌>/audio
+http://192.168.x.x:8765/media/<随机令牌>/manifest.json
 ```
 
-令牌默认 30 分钟失效，可通过 `MUSIC_PROXY_STREAM_TTL` 调整。代理支持 HTTP Range，并且不会把 Navidrome 鉴权参数或上游地址发给设备。
+令牌默认 30 分钟失效，可通过 `MUSIC_PROXY_STREAM_TTL` 调整。代理支持 HTTP Range，并且不会把 Navidrome 鉴权参数或上游地址发给设备。歌词最大 64 KiB；封面下载最大 5 MiB、尺寸最大 4096 × 4096。元数据处理失败不会阻止音频播放。

@@ -56,17 +56,23 @@ def resolve_diagnostic_track(query: str) -> Track | None:
     return None
 
 
-def _register_proxy_sync(track: Track) -> str:
+def _register_proxy_sync(track: Track) -> tuple[str, str]:
     register_url = os.getenv("MUSIC_PROXY_REGISTER_URL", "").strip()
     register_token = os.getenv("MUSIC_PROXY_REGISTER_TOKEN", "").strip()
     if not register_url:
-        return track.audio_url
+        return track.audio_url, ""
 
     body = json.dumps(
         {
             "url": track.audio_url,
             "content_type": track.content_type,
             "title": track.title,
+            "artist": track.artist,
+            "album": track.album,
+            "duration_ms": track.duration * 1000 if track.duration is not None else None,
+            "artwork_url": track.artwork_url,
+            "lyrics": track.lyrics,
+            "lyrics_url": track.lyrics_url,
         }
     ).encode("utf-8")
     request = Request(
@@ -87,14 +93,26 @@ def _register_proxy_sync(track: Track) -> str:
     public_url = str(payload.get("url", "")).strip()
     if not public_url:
         raise RuntimeError("音频代理没有返回播放地址")
-    return public_url
+    return public_url, str(payload.get("metadata_url", "")).strip()
 
 
-async def register_proxy(track: Track) -> str:
+async def register_proxy(track: Track) -> tuple[str, str]:
     return await asyncio.to_thread(_register_proxy_sync, track)
 
 
-def _success_payload(track: Track, audio_url: str, failures: list[dict[str, str]]) -> str:
+def _success_payload(
+    track: Track,
+    audio_url: str,
+    metadata_url: str,
+    failures: list[dict[str, str]],
+) -> str:
+    device_arguments: dict[str, Any] = {
+        "play_type": "url",
+        "url": audio_url,
+        "url_song_name": f"{track.title} - {track.artist}",
+    }
+    if metadata_url:
+        device_arguments["metadata_url"] = metadata_url
     return json.dumps(
         {
             "success": True,
@@ -103,11 +121,8 @@ def _success_payload(track: Track, audio_url: str, failures: list[dict[str, str]
             "fallback_failures": failures,
             "next_step": "立即调用设备端 MCP 工具 self.online_music.play_music",
             "device_tool": "self.online_music.play_music",
-            "device_arguments": {
-                "play_type": "url",
-                "url": audio_url,
-                "url_song_name": f"{track.title} - {track.artist}",
-            },
+            "metadata_url": metadata_url or None,
+            "device_arguments": device_arguments,
         },
         ensure_ascii=False,
     )
@@ -127,7 +142,8 @@ async def resolve_music_url(
     不要改用官方 `play_music`、`search_music` 或 `self.music.play_song`。
     """
     if diagnostic := resolve_diagnostic_track(query):
-        return _success_payload(diagnostic, await register_proxy(diagnostic), [])
+        audio_url, metadata_url = await register_proxy(diagnostic)
+        return _success_payload(diagnostic, audio_url, metadata_url, [])
 
     providers = providers_from_env()
     if not providers:
@@ -153,7 +169,7 @@ async def resolve_music_url(
         )
 
     try:
-        audio_url = await register_proxy(track)
+        audio_url, metadata_url = await register_proxy(track)
     except RuntimeError as exc:
         return json.dumps(
             {
@@ -164,7 +180,7 @@ async def resolve_music_url(
             },
             ensure_ascii=False,
         )
-    return _success_payload(track, audio_url, failures)
+    return _success_payload(track, audio_url, metadata_url, failures)
 
 
 if __name__ == "__main__":
