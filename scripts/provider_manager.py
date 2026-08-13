@@ -250,7 +250,7 @@ def wait_until_ready(spec: ProviderSpec, attempts: int = 60) -> bool:
 
 
 def start(specs: list[ProviderSpec], autostart: bool) -> int:
-    result = 0
+    failed_providers: list[str] = []
     for spec in specs:
         if not spec.enabled:
             continue
@@ -281,8 +281,11 @@ def start(specs: list[ProviderSpec], autostart: bool) -> int:
                 remove_legacy_plist(spec)
                 print(f"Provider {spec.display_name}：已自动启动（{spec.endpoint}）")
             except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
-                print(f"错误：无法启动 Provider {spec.display_name}：{exc}", file=sys.stderr)
-                result = 1
+                failed_providers.append(spec.display_name)
+                print(
+                    f"警告：无法启动 Provider {spec.display_name}：{exc}；MCP 将使用后续来源",
+                    file=sys.stderr,
+                )
         elif endpoint_ready(spec.endpoint):
             print(f"Provider {spec.display_name}：外部服务可用（{spec.endpoint}）")
         else:
@@ -290,7 +293,13 @@ def start(specs: list[ProviderSpec], autostart: bool) -> int:
                 f"警告：Provider {spec.display_name} 已启用但端点不可用；MCP 将使用后续来源（{spec.endpoint}）",
                 file=sys.stderr,
             )
-    return result
+    if failed_providers:
+        print(
+            "警告：以下托管 Provider 暂不可用，但不会阻止 MCP 启动："
+            + "、".join(failed_providers),
+            file=sys.stderr,
+        )
+    return 0
 
 
 def stop(specs: list[ProviderSpec]) -> int:

@@ -38,6 +38,8 @@ NAVIDROME_SERVICE_COMMAND=["navidrome","--configfile","/你的/navidrome.toml"]
 
 命令必须是 JSON 字符串数组，不经 shell 解析；如果 Navidrome 已由 NAS、Docker 或 `brew services` 管理，请保持 `NAVIDROME_SERVICE_MANAGED=false`。
 
+托管 Navidrome 拉起失败时，统一管理命令会记录警告并继续启动 MCP。后续搜索会跳过不可用的 Navidrome，按 `MUSIC_PROVIDER_ORDER` 自动尝试其他来源；可以通过 `bash scripts/music_service.sh status` 和 `logs` 定位 Navidrome 自身问题。
+
 ## Jamendo
 
 注册 Jamendo 开发者账号并创建应用，获得 Client ID：
