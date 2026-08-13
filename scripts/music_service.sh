@@ -23,6 +23,7 @@ usage() {
 
 命令：
   install             交互选择是否启用登录自启动，并启动服务
+  update              更新 origin/main、安装依赖并验证；运行中的服务会自动重启
   start               启动所需 Provider 与 MCP；退出终端后仍继续运行
   stop                停止 MCP 与本项目托管的 Provider
   restart             重启 Provider 与 MCP
@@ -52,6 +53,99 @@ validate_installation() {
         echo "错误：未找到 .env.local 或 .env，请先配置 MCP_ENDPOINT。" >&2
         exit 1
     fi
+}
+
+ensure_python_environment() {
+    if [[ ! -x "${PYTHON_BIN}" ]]; then
+        command -v python3 >/dev/null 2>&1 || {
+            echo "错误：未找到 python3，请先安装 Python 3.10 或更高版本。" >&2
+            return 1
+        }
+        python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || {
+            echo "错误：Python 版本过低，需要 Python 3.10 或更高版本。" >&2
+            return 1
+        }
+        echo "未找到可用的 .venv，正在使用 $(python3 --version 2>&1) 创建。"
+        python3 -m venv "${PROJECT_ROOT}/.venv"
+    fi
+
+    "${PYTHON_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || {
+        echo "错误：.venv 中的 Python 版本低于 3.10，请删除 .venv 后重新运行 update。" >&2
+        return 1
+    }
+}
+
+install_python_dependencies() {
+    ensure_python_environment
+    echo "正在检查并安装 Python 依赖……"
+    "${PYTHON_BIN}" -m pip install --upgrade pip setuptools wheel
+    "${PYTHON_BIN}" -m pip install --upgrade -r "${PROJECT_ROOT}/requirements.txt"
+}
+
+verify_updated_installation() {
+    validate_installation
+    echo "正在验证依赖和服务代码……"
+    "${PYTHON_BIN}" -c \
+        'import fastmcp, mcp, pydantic, dotenv, websockets, curl_cffi, mcp_pipe, music_mcp_server; from PIL import Image'
+    "${PYTHON_BIN}" -m unittest -v \
+        test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
+        test_provider_manager.py
+}
+
+finish_update() {
+    local was_loaded="${1:-false}"
+    install_python_dependencies
+    verify_updated_installation
+
+    if [[ "${was_loaded}" == "true" ]]; then
+        echo "更新验证成功，正在重启 MCP 与托管 Provider……"
+        stop_service
+        start_service
+    else
+        echo "更新验证成功。服务原本未运行，可直接执行：bash scripts/music_service.sh start"
+    fi
+}
+
+update_service() {
+    [[ "$(uname -s)" == "Darwin" ]] || {
+        echo "错误：update 命令目前仅支持 macOS。" >&2
+        return 1
+    }
+    command -v git >/dev/null 2>&1 || {
+        echo "错误：未找到 git。" >&2
+        return 1
+    }
+    git -C "${PROJECT_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+        echo "错误：当前目录不是 Git 仓库，无法自动更新。" >&2
+        return 1
+    }
+    if [[ -n "$(git -C "${PROJECT_ROOT}" status --porcelain)" ]]; then
+        echo "错误：仓库存在未提交修改。为避免覆盖本地文件，请先提交或暂存这些修改。" >&2
+        return 1
+    fi
+
+    local branch
+    branch="$(git -C "${PROJECT_ROOT}" branch --show-current)"
+    if [[ "${branch}" != "main" ]]; then
+        echo "错误：update 只能在 main 分支运行，当前分支为 ${branch:-分离 HEAD}。" >&2
+        return 1
+    fi
+    git -C "${PROJECT_ROOT}" remote get-url origin >/dev/null 2>&1 || {
+        echo "错误：未配置 Git 远端 origin。" >&2
+        return 1
+    }
+
+    local was_loaded="false"
+    if is_loaded; then
+        was_loaded="true"
+    fi
+
+    echo "正在从 GitHub 获取 origin/main……"
+    git -C "${PROJECT_ROOT}" fetch --prune origin main
+    git -C "${PROJECT_ROOT}" merge --ff-only origin/main
+    # Reload the script from the updated checkout so dependency checks and
+    # restart behavior always come from the newly pulled version.
+    exec bash "${PROJECT_ROOT}/scripts/music_service.sh" _finish-update "${was_loaded}"
 }
 
 start_providers() {
@@ -238,6 +332,12 @@ command_name="${1:-}"
 case "${command_name}" in
     install)
         install_interactive
+        ;;
+    update)
+        update_service
+        ;;
+    _finish-update)
+        finish_update "${2:-false}"
         ;;
     start)
         start_service
