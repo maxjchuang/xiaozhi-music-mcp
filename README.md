@@ -126,6 +126,8 @@ bash scripts/music_service.sh install
 
 启动命令会读取当前 Provider 配置，先自动拉起需要本地进程的托管 Provider，再启动 MCP。停止、重启、状态、自启动切换和日志查看也会统一管理这些进程。网易云本机端点默认托管；Navidrome 或通用适配器只有显式配置 `*_SERVICE_MANAGED=true` 时才由本项目拉起。Fangpi 与 Jamendo 是远程 HTTP 来源，不会创建本地进程。
 
+Provider 采用故障隔离：单个托管 Provider 拉起失败只会输出警告，不会阻止 MCP 启动；搜索时也会自动继续尝试后续来源。启动命令只有在项目安装、环境文件或 Provider 配置语法本身无效时才会失败。
+
 日常管理命令：
 
 ```bash
