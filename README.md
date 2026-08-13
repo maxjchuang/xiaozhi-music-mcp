@@ -132,6 +132,7 @@ Provider 采用故障隔离：单个托管 Provider 拉起失败只会输出警�
 
 ```bash
 bash scripts/music_service.sh start
+bash scripts/music_service.sh update
 bash scripts/music_service.sh stop
 bash scripts/music_service.sh restart
 bash scripts/music_service.sh status
@@ -139,6 +140,8 @@ bash scripts/music_service.sh enable-autostart
 bash scripts/music_service.sh disable-autostart
 bash scripts/music_service.sh logs
 ```
+
+`update` 会在干净的 `main` 分支上快进到 GitHub `origin/main`，自动创建或复用 `.venv`、升级安装 `requirements.txt` 中的依赖，并运行完整回归测试。服务原本在运行时会在全部验证成功后自动重启；服务原本已停止时保持停止，随后可直接运行 `start`。为保护本地改动，工作区不干净、当前不在 `main` 或无法快进时会停止更新。
 
 `disable-autostart` 不会中断正在运行的服务，只会阻止它在下次登录时自动启动。`stop` 不会改变自启动设置。
 
@@ -274,6 +277,7 @@ bash scripts/music_service.sh stop
 
 ```bash
 bash scripts/music_service.sh install
+bash scripts/music_service.sh update
 bash scripts/music_service.sh status
 bash scripts/music_service.sh logs
 ```
