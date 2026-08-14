@@ -155,11 +155,39 @@ fi
 set_env_value MUSIC_PROXY_PORT "8765"
 printf '音频代理端口已固定为 8765。\n'
 
+info "配置可选的飞书使用行为统计"
+analytics_enabled="$(env_value FEISHU_ANALYTICS_ENABLED || true)"
+if [[ "${analytics_enabled}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ ]] || \
+    ask_yes_no "是否启用飞书多维表格行为统计？" "no"; then
+    set_env_value FEISHU_ANALYTICS_ENABLED "true"
+    set_env_value ANALYTICS_ENABLED "true"
+    set_env_value FEISHU_AUTH_REQUIRED_ON_START "false"
+
+    command -v lark-cli >/dev/null 2>&1 || \
+        fail "启用飞书统计需要先安装 lark-cli；安装完成后重新运行部署向导。"
+    set_env_value LARK_CLI_BIN "$(command -v lark-cli)"
+
+    feishu_base_token="$(env_value FEISHU_BASE_TOKEN || true)"
+    if [[ -z "${feishu_base_token}" ]]; then
+        read -r -p "飞书多维表格 Base Token：" feishu_base_token
+        [[ -n "${feishu_base_token}" ]] || fail "启用飞书统计时 FEISHU_BASE_TOKEN 不能为空。"
+        set_env_value FEISHU_BASE_TOKEN "${feishu_base_token}"
+    fi
+
+    printf '即将启动飞书 CLI Device Flow，不需要配置 OAuth 回调地址。\n'
+    "${VENV_PYTHON}" scripts/analytics_manager.py auth login
+    "${VENV_PYTHON}" scripts/analytics_manager.py analytics init
+    "${VENV_PYTHON}" scripts/analytics_manager.py analytics test
+else
+    set_env_value FEISHU_ANALYTICS_ENABLED "false"
+    printf '已跳过飞书统计配置；以后可按 README 手动启用。\n'
+fi
+
 if [[ "${skip_tests}" == "false" ]]; then
     info "运行本地测试"
     "${VENV_PYTHON}" -m unittest -v \
         test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
-        test_provider_manager.py
+        test_provider_manager.py test_usage_analytics.py test_lark_cli.py test_feishu_sync.py
     "${VENV_PYTHON}" test_mcp.py
     "${VENV_PYTHON}" test_mcp_pipe.py
 else

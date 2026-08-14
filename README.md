@@ -19,6 +19,7 @@ music_mcp_server.py（按优先级搜索歌曲）
 - `mcp_pipe.py` 会在局域网启动动态音频代理，隐藏上游鉴权信息并解决部分 ESP32 无法直连 HTTPS/CDN 的问题；默认端口为 `8765`。
 - 新版代理会为每首歌生成短期媒体清单。封面按需裁剪为 360 × 360 暗化背景和 192 × 192 唱片；可用歌词以 LRC 转发。旧 `/stream/<令牌>` 地址仍兼容。
 - Provider 配置和非官方适配器协议见 [PROVIDERS.md](PROVIDERS.md)。
+- 使用行为记录和飞书仪表盘的架构见 [飞书行为分析设计](docs/FEISHU_ANALYTICS_DESIGN.md)，当前实施进度见 [代码实施计划](docs/FEISHU_ANALYTICS_IMPLEMENTATION_PLAN.md)。
 - 电脑必须保持开机、联网，桥接程序必须持续运行。
 
 ## 1. 获取新的 MCP 接入点
@@ -180,6 +181,57 @@ python mcp_pipe.py
 - “播放海阔天空 Beyond”（需要相应音乐源中存在该歌曲）
 
 前台运行时，停止服务请按 `Ctrl+C`。
+
+## 飞书使用行为统计（可选）
+
+启用后，搜索、Provider 结果和设备首次请求音频等事件会先写入本地 SQLite，再由后台 Worker 异步同步到飞书多维表格。飞书断网或登录失效不会影响音乐播放，授权恢复后会自动补传。
+
+### 1. 安装并登录飞书 CLI
+
+先安装官方 `lark-cli`，并确认命令可用：
+
+```bash
+lark-cli --version
+```
+
+项目使用 CLI 的 Device Flow 登录，不需要创建本地回调服务器，也不需要在项目中配置 App ID、App Secret、Access Token 或 Refresh Token。首次使用时，管理命令会在需要时执行 CLI 配置初始化，并申请 Base 业务域权限。登录用户仍需对目标多维表格具有可管理权限。
+
+### 2. 配置并登录
+
+在 `.env.local` 中配置：
+
+```dotenv
+ANALYTICS_ENABLED=true
+ANALYTICS_TRANSCRIPT_MODE=masked
+
+FEISHU_ANALYTICS_ENABLED=true
+FEISHU_AUTH_REQUIRED_ON_START=false
+LARK_CLI_BIN=
+FEISHU_BASE_TOKEN=多维表格URL中base/后面的Token
+```
+
+完成首次登录和初始化：
+
+```bash
+bash scripts/music_service.sh auth login
+bash scripts/music_service.sh analytics init
+bash scripts/music_service.sh analytics test
+```
+
+`auth login` 会调用 `lark-cli auth login --domain base`，按 CLI 提示完成 Device Flow 授权。Token 的存储和刷新由 CLI 管理，项目不会读取 Token。`analytics init` 会创建或校验“原始事件”表和“小智使用分析”仪表盘，并将表 ID、仪表盘 ID 写入权限为 `0600` 的 `.env`。
+
+### 3. 日常管理
+
+```bash
+bash scripts/music_service.sh auth status
+bash scripts/music_service.sh analytics status
+bash scripts/music_service.sh analytics sync
+bash scripts/music_service.sh analytics retry
+```
+
+交互式执行 `start` 时，如果尚未登录，会自动进入登录流程。LaunchAgent 等后台启动不会等待浏览器；它会记录 `AUTH_REQUIRED`，保留本地事件并继续提供音乐服务。只有显式设置 `FEISHU_AUTH_REQUIRED_ON_START=true` 时，授权失败才会阻止启动。
+
+当前版本能完整统计 MCP 可观察到的音乐搜索和开始播放行为。普通对话、唤醒、自然播放结束、换歌和音频欠载需要 EchoEar 固件增加遥测上报后才能准确记录。
 
 ## 迁移到另一台电脑
 

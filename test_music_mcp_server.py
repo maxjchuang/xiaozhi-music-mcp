@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from music_mcp_server import _register_proxy_sync, _success_payload
+from music_mcp_server import _register_proxy_sync, _success_payload, resolve_music_url
 from music_providers import Track
 
 
@@ -61,6 +61,22 @@ class MusicMcpServerTests(unittest.TestCase):
         self.assertEqual(audio_url, "http://lan/audio")
         self.assertEqual(metadata_url, "http://lan/manifest.json")
         self.assertNotIn("lyrics", track.public_dict())
+
+
+class MusicAnalyticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_diagnostic_search_uses_one_trace_for_search_and_playback_handoff(self) -> None:
+        recorder = MagicMock()
+        with (
+            patch("music_mcp_server.get_recorder", return_value=recorder),
+            patch("music_mcp_server.register_proxy", new=AsyncMock(return_value=("http://lan/audio", ""))),
+        ):
+            payload = json.loads(await resolve_music_url("播放乐鑫官方测试音频"))
+
+        self.assertTrue(payload["success"])
+        event_types = [call.args[0] for call in recorder.emit.call_args_list]
+        self.assertEqual(event_types, ["music_search_started", "music_search_succeeded"])
+        trace_ids = [call.kwargs["trace_id"] for call in recorder.emit.call_args_list]
+        self.assertEqual(len(set(trace_ids)), 1)
 
 
 if __name__ == "__main__":

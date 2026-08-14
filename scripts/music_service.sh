@@ -31,6 +31,8 @@ usage() {
   enable-autostart    开启登录自启动，并立即启动服务
   disable-autostart   关闭登录自启动；若服务正在运行则保持运行
   logs                持续查看服务日志，按 Ctrl+C 退出
+  auth <命令>         飞书登录管理：status、login、logout
+  analytics <命令>    行为统计管理：init、status、sync、retry、test
 EOF
 }
 
@@ -86,10 +88,10 @@ verify_updated_installation() {
     validate_installation
     echo "正在验证依赖和服务代码……"
     "${PYTHON_BIN}" -c \
-        'import fastmcp, mcp, pydantic, dotenv, websockets, curl_cffi, mcp_pipe, music_mcp_server; from PIL import Image'
+        'import fastmcp, mcp, pydantic, dotenv, websockets, curl_cffi, mcp_pipe, music_mcp_server, usage_analytics, lark_cli, feishu_sync; from PIL import Image'
     "${PYTHON_BIN}" -m unittest -v \
         test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
-        test_provider_manager.py
+        test_provider_manager.py test_usage_analytics.py test_lark_cli.py test_feishu_sync.py
 }
 
 finish_update() {
@@ -154,6 +156,14 @@ start_providers() {
         arguments+=(--autostart)
     fi
     "${PYTHON_BIN}" "${PROVIDER_MANAGER}" "${arguments[@]}"
+}
+
+analytics_auth_preflight() {
+    local auth_arguments=(auth preflight)
+    if [[ -t 0 && -t 1 ]]; then
+        auth_arguments+=(--interactive)
+    fi
+    "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/analytics_manager.py" "${auth_arguments[@]}"
 }
 
 stop_providers() {
@@ -224,6 +234,7 @@ bootstrap_service() {
 
 start_service() {
     validate_installation
+    analytics_auth_preflight
     start_providers
     if is_running; then
         echo "小智音乐 MCP 已在运行。"
@@ -256,6 +267,7 @@ stop_service() {
 
 enable_autostart() {
     validate_installation
+    analytics_auth_preflight
     bootout_if_loaded
     stop_providers
     render_plist "${AUTOSTART_PLIST}"
@@ -368,6 +380,14 @@ case "${command_name}" in
             "${PROVIDER_LOG_DIR}/netease.log" "${PROVIDER_LOG_DIR}/netease.error.log" \
             "${PROVIDER_LOG_DIR}/navidrome.log" "${PROVIDER_LOG_DIR}/navidrome.error.log" \
             "${PROVIDER_LOG_DIR}/unofficial.log" "${PROVIDER_LOG_DIR}/unofficial.error.log"
+        ;;
+    auth)
+        validate_installation
+        "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/analytics_manager.py" auth "${2:-status}"
+        ;;
+    analytics)
+        validate_installation
+        "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/analytics_manager.py" analytics "${2:-status}"
         ;;
     -h|--help|help|"")
         usage

@@ -23,8 +23,8 @@ EchoEar 固件 / 小智云端 / 音乐 MCP
                │
                │ 后台批量同步
                ▼
-         飞书 OpenAPI 适配器
-        ├─ OAuth 登录与刷新
+           飞书 CLI 适配器
+        ├─ Device Flow 登录检查
         ├─ 表结构校验
         └─ 批量新增或更新
                │
@@ -32,7 +32,7 @@ EchoEar 固件 / 小智云端 / 音乐 MCP
        飞书多维表格及仪表盘
 ```
 
-运行时不依赖 Codex、Agent、页面操作或 Cookie。程序通过飞书 OAuth 获取用户授权，使用持久化的刷新凭证自动续期，并直接调用飞书 OpenAPI。
+运行时不依赖 Codex、Agent、页面操作或 Cookie。程序通过 `lark-cli` 的 Device Flow 获取用户授权，由 CLI 持久化并刷新登录凭证，再通过结构化 Base 命令或通用 API 命令访问飞书。
 
 ## 3. 数据来源与边界
 
@@ -160,19 +160,19 @@ SQLite 是统计链路的事实来源，至少包含以下逻辑表：
 
 ## 8. 登录、授权与启动策略
 
-### 8.1 OAuth 状态机
+### 8.1 飞书 CLI 登录状态机
 
 启动前检查以下状态：
 
-1. 未配置飞书应用：提示缺少 `app_id` 等基础配置；
-2. 没有本地凭证：交互式启动时打开浏览器完成 OAuth；
-3. Access Token 过期：使用 Refresh Token 静默刷新；
-4. Refresh Token 失效：交互式启动时要求重新登录；
-5. 授权范围不足：重新发起增量授权；
+1. 未安装 CLI：提示安装 `lark-cli`；
+2. CLI 尚未初始化：交互式执行 `lark-cli config init --new`；
+3. 没有用户登录态：通过 Device Flow 完成登录，不需要 OAuth 回调地址；
+4. Token 过期：由 `lark-cli auth status --verify` 验证并刷新；
+5. Base 授权范围不足：执行 `lark-cli auth login --domain base` 增量授权；
 6. 无权访问目标多维表格：给出明确诊断；
 7. 表结构不匹配：提示执行初始化或迁移命令。
 
-OAuth 回调只监听本机回环地址。Token 优先保存在 macOS Keychain；不支持系统密钥库时才使用权限为 `0600` 的本地凭证文件。任何 Token、应用密钥或 Base Token 都不得提交到 Git。
+项目不读取或保存飞书 Access Token、Refresh Token、App ID 和 App Secret，凭证生命周期完全交给 `lark-cli`。项目只保存目标 Base Token、表 ID 和仪表盘 ID，这些配置也不得提交到 Git。
 
 ### 8.2 服务降级
 
@@ -205,15 +205,15 @@ bash scripts/music_service.sh start
 ```
 
 - `auth status`：检查本地登录、Token 有效期、授权范围和 Base 权限；
-- `auth login`：打开浏览器完成 OAuth 登录；
-- `auth logout`：撤销或清除本机凭证；
+- `auth login`：调用飞书 CLI Device Flow 完成登录；
+- `auth logout`：调用飞书 CLI 清除本机用户登录态；
 - `analytics init`：创建或校验数据表、字段和仪表盘；
 - `analytics status`：显示本地队列、失败数和最近同步时间；
 - `analytics sync`：立即同步一批记录；
 - `analytics retry`：重新投递死信事件；
 - `analytics test`：写入测试事件并验证飞书记录可读。
 
-部署向导负责询问是否启用行为分析、完成首次 OAuth、选择或创建 Base，并把非敏感配置写入本地环境文件。
+部署向导负责询问是否启用行为分析、检查并完成 CLI 登录、选择或创建 Base，并把非敏感配置写入本地环境文件。
 
 ## 10. 隐私与数据治理
 
@@ -236,7 +236,7 @@ ANALYTICS_TRANSCRIPT_MODE=masked
 - 限制文本和错误载荷长度；
 - 支持按会话 ID 查询和删除；
 - 本地原始事件按配置定期清理；
-- 日志不得输出 OAuth Token、App Secret 或完整用户隐私字段。
+- 日志不得输出 CLI 登录凭证、Base Token 或完整用户隐私字段。
 
 ## 11. 验收标准
 
@@ -270,7 +270,7 @@ ANALYTICS_TRANSCRIPT_MODE=masked
 
 1. **基础设施**：事件模型、SQLite、outbox、隐私过滤和单元测试；
 2. **音乐行为接入**：搜索、Provider、媒体登记等 MCP 侧事件；
-3. **飞书授权与同步**：OAuth、凭证存储、批量同步、重试和管理命令；
+3. **飞书授权与同步**：CLI 登录检查、批量同步、重试和管理命令；
 4. **Base 与仪表盘初始化**：表结构、迁移、图表和端到端测试；
 5. **固件遥测接入**：唤醒、ASR、实际播放状态和设备故障；
 6. **运营完善**：数据保留、删除、告警、每日汇总和多设备分析。
