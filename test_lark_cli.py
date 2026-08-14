@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -32,6 +33,20 @@ class LarkCliTests(unittest.TestCase):
         with patch("lark_cli.subprocess.run", return_value=completed):
             result = LarkCli("/usr/local/bin/lark-cli").run(["base", "+table-list"])
         self.assertEqual(result["data"]["value"], 1)
+
+    def test_executable_directory_is_added_to_path(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["lark-cli"], 0, stdout=json.dumps({"ok": True}), stderr=""
+        )
+        executable = "/Users/test/.nvm/versions/node/v22/bin/lark-cli"
+        with patch("lark_cli.subprocess.run", return_value=completed) as run:
+            LarkCli(executable).run(["auth", "status"])
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep)[0],
+            "/Users/test/.nvm/versions/node/v22/bin",
+        )
 
     def test_error_envelope_raises(self) -> None:
         completed = subprocess.CompletedProcess(

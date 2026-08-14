@@ -21,10 +21,20 @@ class LarkCli:
         if not self.executable:
             raise LarkCliError("找不到 lark-cli，请先安装飞书 CLI")
 
-    def run(self, arguments: Sequence[str], *, timeout: float = 60) -> dict[str, Any]:
+    def _environment(self) -> dict[str, str]:
         environment = os.environ.copy()
+        executable_directory = os.path.dirname(os.path.abspath(self.executable))
+        path_entries = environment.get("PATH", "").split(os.pathsep)
+        if executable_directory not in path_entries:
+            environment["PATH"] = os.pathsep.join(
+                [executable_directory, *(entry for entry in path_entries if entry)]
+            )
         environment["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
         environment["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
+        return environment
+
+    def run(self, arguments: Sequence[str], *, timeout: float = 60) -> dict[str, Any]:
+        environment = self._environment()
         try:
             completed = subprocess.run(
                 [self.executable, *arguments],
@@ -51,9 +61,7 @@ class LarkCli:
         return payload
 
     def run_interactive(self, arguments: Sequence[str]) -> None:
-        environment = os.environ.copy()
-        environment["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
-        environment["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
+        environment = self._environment()
         try:
             completed = subprocess.run(
                 [self.executable, *arguments],
