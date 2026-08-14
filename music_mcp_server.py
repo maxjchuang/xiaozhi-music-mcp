@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from typing import Annotated, Any
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -14,6 +16,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from music_providers import ProviderChain, Track, providers_from_env
+from usage_analytics import get_recorder
 
 
 mcp = FastMCP("xiaozhi-music-resolver")
@@ -56,7 +59,7 @@ def resolve_diagnostic_track(query: str) -> Track | None:
     return None
 
 
-def _register_proxy_sync(track: Track) -> tuple[str, str]:
+def _register_proxy_sync(track: Track, trace_id: str = "") -> tuple[str, str]:
     register_url = os.getenv("MUSIC_PROXY_REGISTER_URL", "").strip()
     register_token = os.getenv("MUSIC_PROXY_REGISTER_TOKEN", "").strip()
     if not register_url:
@@ -73,6 +76,8 @@ def _register_proxy_sync(track: Track) -> tuple[str, str]:
             "artwork_url": track.artwork_url,
             "lyrics": track.lyrics,
             "lyrics_url": track.lyrics_url,
+            "provider": track.provider,
+            "trace_id": trace_id,
         }
     ).encode("utf-8")
     request = Request(
@@ -96,8 +101,25 @@ def _register_proxy_sync(track: Track) -> tuple[str, str]:
     return public_url, str(payload.get("metadata_url", "")).strip()
 
 
-async def register_proxy(track: Track) -> tuple[str, str]:
-    return await asyncio.to_thread(_register_proxy_sync, track)
+async def register_proxy(track: Track, trace_id: str = "") -> tuple[str, str]:
+    return await asyncio.to_thread(_register_proxy_sync, track, trace_id)
+
+
+async def record_event(
+    event_type: str,
+    *,
+    trace_id: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    recorder = get_recorder()
+    if recorder is not None:
+        await asyncio.to_thread(
+            recorder.emit,
+            event_type,
+            source="mcp",
+            trace_id=trace_id,
+            payload=payload,
+        )
 
 
 def _success_payload(
@@ -141,12 +163,36 @@ async def resolve_music_url(
     `self.online_music.play_music`，并原样使用返回的 `device_arguments`。
     不要改用官方 `play_music`、`search_music` 或 `self.music.play_song`。
     """
+    trace_id = uuid.uuid4().hex
+    started_at = time.monotonic()
+    await record_event(
+        "music_search_started",
+        trace_id=trace_id,
+        payload={"query": query},
+    )
     if diagnostic := resolve_diagnostic_track(query):
-        audio_url, metadata_url = await register_proxy(diagnostic)
+        audio_url, metadata_url = await register_proxy(diagnostic, trace_id)
+        await record_event(
+            "music_search_succeeded",
+            trace_id=trace_id,
+            payload={
+                "query": query,
+                "provider": diagnostic.provider,
+                "title": diagnostic.title,
+                "artist": diagnostic.artist,
+                "duration_ms": diagnostic.duration * 1000 if diagnostic.duration is not None else None,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            },
+        )
         return _success_payload(diagnostic, audio_url, metadata_url, [])
 
     providers = providers_from_env()
     if not providers:
+        await record_event(
+            "music_search_failed",
+            trace_id=trace_id,
+            payload={"query": query, "reason": "no_provider", "elapsed_ms": round((time.monotonic() - started_at) * 1000)},
+        )
         return json.dumps(
             {
                 "success": False,
@@ -158,6 +204,16 @@ async def resolve_music_url(
 
     track, failures = await ProviderChain(providers, timeout=provider_timeout_seconds()).search(query)
     if track is None:
+        await record_event(
+            "music_search_failed",
+            trace_id=trace_id,
+            payload={
+                "query": query,
+                "reason": "not_found",
+                "failures": failures,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            },
+        )
         return json.dumps(
             {
                 "success": False,
@@ -169,8 +225,20 @@ async def resolve_music_url(
         )
 
     try:
-        audio_url, metadata_url = await register_proxy(track)
+        audio_url, metadata_url = await register_proxy(track, trace_id)
     except RuntimeError as exc:
+        await record_event(
+            "music_search_failed",
+            trace_id=trace_id,
+            payload={
+                "query": query,
+                "reason": "proxy_registration_failed",
+                "provider": track.provider,
+                "title": track.title,
+                "error": str(exc),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            },
+        )
         return json.dumps(
             {
                 "success": False,
@@ -180,6 +248,20 @@ async def resolve_music_url(
             },
             ensure_ascii=False,
         )
+    await record_event(
+        "music_search_succeeded",
+        trace_id=trace_id,
+        payload={
+            "query": query,
+            "provider": track.provider,
+            "title": track.title,
+            "artist": track.artist,
+            "album": track.album,
+            "duration_ms": track.duration * 1000 if track.duration is not None else None,
+            "fallback_failures": failures,
+            "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+        },
+    )
     return _success_payload(track, audio_url, metadata_url, failures)
 
 

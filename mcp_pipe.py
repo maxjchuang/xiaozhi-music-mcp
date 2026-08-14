@@ -27,6 +27,9 @@ from dotenv import load_dotenv
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
 import websockets
 
+from usage_analytics import get_recorder
+from feishu_sync import start_sync_worker
+
 
 LOGGER = logging.getLogger("xiaozhi-mcp-pipe")
 INITIAL_BACKOFF_SECONDS = 1
@@ -53,6 +56,10 @@ class StreamSource:
     artwork_url: str = ""
     lyrics: str = ""
     lyrics_url: str = ""
+    provider: str = ""
+    trace_id: str = ""
+    playback_reported: bool = False
+    playback_lock: threading.Lock = field(default_factory=threading.Lock)
     background_jpeg: bytes | None = None
     disc_jpeg: bytes | None = None
     assets_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -81,6 +88,8 @@ class AudioProxyServer(ThreadingHTTPServer):
         artwork_url: str = "",
         lyrics: str = "",
         lyrics_url: str = "",
+        provider: str = "",
+        trace_id: str = "",
     ) -> tuple[str, str]:
         now = time.time()
         token = secrets.token_urlsafe(18)
@@ -102,6 +111,8 @@ class AudioProxyServer(ThreadingHTTPServer):
                 artwork_url=artwork_url,
                 lyrics=lyrics.encode("utf-8")[:MAX_LYRICS_BYTES].decode("utf-8", errors="ignore"),
                 lyrics_url=lyrics_url,
+                provider=provider,
+                trace_id=trace_id,
             )
         return (
             f"{self.public_base_url}{MEDIA_PREFIX}{token}/audio",
@@ -188,6 +199,8 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             artwork_url=artwork_url,
             lyrics=str(payload.get("lyrics", "")),
             lyrics_url=lyrics_url,
+            provider=str(payload.get("provider", ""))[:100],
+            trace_id=str(payload.get("trace_id", ""))[:128],
         )
         body = json.dumps({"url": public_url, "metadata_url": metadata_url}).encode("utf-8")
         self.send_response(201)
@@ -217,6 +230,7 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             return
 
         if resource == "audio":
+            self._report_playback_started(source)
             self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
         elif resource == "manifest.json":
             self._serve_manifest(token, source)
@@ -232,7 +246,28 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         if source is None:
             self.send_error(404, "stream expired or unknown")
             return
+        self._report_playback_started(source)
         self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
+
+    def _report_playback_started(self, source: StreamSource) -> None:
+        with source.playback_lock:
+            if source.playback_reported:
+                return
+            source.playback_reported = True
+        recorder = get_recorder()
+        if recorder is not None:
+            recorder.emit(
+                "playback_started",
+                source="proxy",
+                trace_id=source.trace_id,
+                payload={
+                    "title": source.title,
+                    "artist": source.artist,
+                    "album": source.album,
+                    "provider": source.provider,
+                    "duration_ms": source.duration_ms,
+                },
+            )
 
     def _serve_manifest(self, token: str, source: StreamSource) -> None:
         artwork = None
@@ -595,11 +630,15 @@ def main() -> int:
         LOGGER.error("无法启动测试音频代理：%s", exc)
         return 2
 
+    sync_worker = start_sync_worker()
+
     try:
         asyncio.run(run_forever(endpoint, server_script))
     except KeyboardInterrupt:
         LOGGER.info("已停止 MCP 桥接")
     finally:
+        if sync_worker is not None:
+            sync_worker.stop()
         proxy.shutdown()
         proxy.server_close()
     return 0
