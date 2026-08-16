@@ -36,10 +36,21 @@ def store_music_u(config_path: Path, cookie: str) -> None:
     match = re.search(r"(?:^|;\s*)MUSIC_U=([^;]+)", cookie)
     if not match:
         raise RuntimeError("登录成功，但响应中没有 MUSIC_U")
-    setting = f"NETEASE_COOKIE=MUSIC_U={match.group(1)}"
+    replace_music_u(config_path, f"NETEASE_COOKIE=MUSIC_U={match.group(1)}")
+
+
+def remove_music_u(config_path: Path) -> bool:
+    current = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    existed = any(line.startswith("NETEASE_COOKIE=") for line in current.splitlines())
+    replace_music_u(config_path, None)
+    return existed
+
+
+def replace_music_u(config_path: Path, setting: str | None) -> None:
     current = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     lines = [line for line in current.splitlines() if not line.startswith("NETEASE_COOKIE=")]
-    lines.append(setting)
+    if setting:
+        lines.append(setting)
     content = "\n".join(lines) + "\n"
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +65,30 @@ def store_music_u(config_path: Path, cookie: str) -> None:
             os.unlink(temporary_name)
 
 
+def poll_login(base_url: str, key: str, config_path: Path, timeout: int) -> int:
+    deadline = time.monotonic() + timeout
+    previous_code: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            payload = request_status(base_url, key)
+        except (TimeoutError, URLError, OSError):
+            time.sleep(2)
+            continue
+        code = int(payload.get("code", 0))
+        if code != previous_code:
+            print(STATUS_MESSAGES.get(code, f"登录状态：{code}"), flush=True)
+            previous_code = code
+        if code == 803:
+            store_music_u(config_path, str(payload.get("cookie", "")))
+            print("账号凭据已安全保存到本机服务配置", flush=True)
+            return 0
+        if code == 800:
+            return 2
+        time.sleep(2)
+    print("等待登录确认超时", flush=True)
+    return 3
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--key", required=True)
@@ -66,27 +101,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=180)
     args = parser.parse_args()
 
-    deadline = time.monotonic() + args.timeout
-    previous_code: int | None = None
-    while time.monotonic() < deadline:
-        try:
-            payload = request_status(args.base_url, args.key)
-        except (TimeoutError, URLError, OSError):
-            time.sleep(2)
-            continue
-        code = int(payload.get("code", 0))
-        if code != previous_code:
-            print(STATUS_MESSAGES.get(code, f"登录状态：{code}"), flush=True)
-            previous_code = code
-        if code == 803:
-            store_music_u(args.config, str(payload.get("cookie", "")))
-            print("账号凭据已安全保存到本机服务配置", flush=True)
-            return 0
-        if code == 800:
-            return 2
-        time.sleep(2)
-    print("等待登录确认超时", flush=True)
-    return 3
+    return poll_login(args.base_url, args.key, args.config, args.timeout)
 
 
 if __name__ == "__main__":
