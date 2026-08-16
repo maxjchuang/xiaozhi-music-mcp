@@ -21,7 +21,7 @@ music_mcp_server.py（按优先级搜索歌曲）
 - `mcp_pipe.py` 会在局域网启动动态音频代理，隐藏上游鉴权信息并解决部分 ESP32 无法直连 HTTPS/CDN 的问题；默认端口为 `8765`。
 - 新版代理会为每首歌生成短期媒体清单。封面按需裁剪为 360 × 360 暗化背景和 192 × 192 唱片；可用歌词以 LRC 转发。旧 `/stream/<令牌>` 地址仍兼容。
 - Provider 配置和非官方适配器协议见 [PROVIDERS.md](PROVIDERS.md)。
-- 使用行为记录和飞书仪表盘的架构见 [飞书行为分析设计](docs/FEISHU_ANALYTICS_DESIGN.md)，当前实施进度见 [代码实施计划](docs/FEISHU_ANALYTICS_IMPLEMENTATION_PLAN.md)。
+- 使用行为记录和飞书仪表盘的基础架构见 [飞书行为分析设计](docs/FEISHU_ANALYTICS_DESIGN.md)，固件遥测、播放时长、自然完播率和搜索不满意分析见 [飞书数据分析第二阶段方案](docs/FEISHU_ANALYTICS_PHASE2_DESIGN.md)，当前实施进度见 [代码实施计划](docs/FEISHU_ANALYTICS_IMPLEMENTATION_PLAN.md)。
 - 电脑必须保持开机、联网，桥接程序必须持续运行。
 
 ## 1. 获取新的 MCP 接入点
