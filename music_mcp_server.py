@@ -16,6 +16,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from music_providers import ProviderChain, Track, providers_from_env
+from music_search import MusicSearchResult, SmartMusicSearch
 from usage_analytics import get_recorder
 
 
@@ -49,6 +50,10 @@ def provider_timeout_seconds() -> float:
     except ValueError:
         return DEFAULT_PROVIDER_TIMEOUT_SECONDS
     return value if 1 <= value <= 60 else DEFAULT_PROVIDER_TIMEOUT_SECONDS
+
+
+def smart_search_enabled() -> bool:
+    return os.getenv("MUSIC_SMART_SEARCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def resolve_diagnostic_track(query: str) -> Track | None:
@@ -135,8 +140,7 @@ def _success_payload(
     }
     if metadata_url:
         device_arguments["metadata_url"] = metadata_url
-    return json.dumps(
-        {
+    payload: dict[str, Any] = {
             "success": True,
             **track.public_dict(),
             "audio_url": audio_url,
@@ -145,9 +149,37 @@ def _success_payload(
             "device_tool": "self.online_music.play_music",
             "metadata_url": metadata_url or None,
             "device_arguments": device_arguments,
-        },
-        ensure_ascii=False,
-    )
+        }
+    if track.is_preview:
+        payload.update(
+            {
+                "assistant_notice": track.notice or "这首目前只提供30秒试听，我先播放试听版。",
+                "recommended_action": "netease_relogin" if track.access_status in {"login_required", "membership_required"} else "try_another_version",
+                "account_command": "bash scripts/music_service.sh netease relogin",
+                "next_step": "先用一句话简短说明 assistant_notice，然后立即调用设备端 MCP 工具 self.online_music.play_music",
+            }
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _search_diagnostics(result: MusicSearchResult) -> dict[str, Any]:
+    selected = result.selected
+    return {
+        "raw_query": result.query.raw_query,
+        "normalized_query": result.query.normalized_query,
+        "correction_type": result.query.correction_type,
+        "correction_from": result.query.correction_from,
+        "query_variants": list(result.query.variants()),
+        "candidate_count": result.candidate_count,
+        "selected_rank": selected.candidate.source_rank + 1 if selected else None,
+        "match_score": selected.score if selected else None,
+        "match_reasons": list(selected.reasons) if selected else [],
+        "playback_access": result.track.access_status if result.track else "",
+        "is_preview": result.track.is_preview if result.track else False,
+        "account_status": result.account_status,
+        "top_candidates": [candidate.public_dict() for candidate in result.candidates],
+        "rejected": list(result.rejected),
+    }
 
 
 @mcp.tool()
@@ -202,8 +234,41 @@ async def resolve_music_url(
             ensure_ascii=False,
         )
 
-    track, failures = await ProviderChain(providers, timeout=provider_timeout_seconds()).search(query)
+    smart_result: MusicSearchResult | None = None
+    if smart_search_enabled():
+        smart_result = await SmartMusicSearch(providers, timeout=provider_timeout_seconds()).search(query)
+        failures = list(smart_result.failures)
+        track = smart_result.track
+        if smart_result.status == "needs_confirmation" and smart_result.selected and track:
+            diagnostics = _search_diagnostics(smart_result)
+            await record_event(
+                "music_search_confirmation_required",
+                trace_id=trace_id,
+                payload={
+                    "query": query,
+                    "title": track.title,
+                    "artist": track.artist,
+                    "provider": track.provider,
+                    **diagnostics,
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                },
+            )
+            return json.dumps(
+                {
+                    "success": False,
+                    "status": "needs_confirmation",
+                    "message": f"找到的最接近结果是《{track.title}》 - {track.artist}，是否播放？",
+                    "candidate": smart_result.selected.public_dict(),
+                    "candidates": [candidate.public_dict() for candidate in smart_result.candidates[:3]],
+                    "normalized_query": smart_result.query.normalized_query,
+                    "fallback_failures": failures,
+                },
+                ensure_ascii=False,
+            )
+    else:
+        track, failures = await ProviderChain(providers, timeout=provider_timeout_seconds()).search(query)
     if track is None:
+        diagnostics = _search_diagnostics(smart_result) if smart_result else {}
         await record_event(
             "music_search_failed",
             trace_id=trace_id,
@@ -211,6 +276,7 @@ async def resolve_music_url(
                 "query": query,
                 "reason": "not_found",
                 "failures": failures,
+                **diagnostics,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000),
             },
         )
@@ -220,6 +286,8 @@ async def resolve_music_url(
                 "message": f"没有找到可播放的歌曲：{query}",
                 "searched_providers": [provider.name for provider in providers],
                 "fallback_failures": failures,
+                "normalized_query": smart_result.query.normalized_query if smart_result else query,
+                "candidates": [candidate.public_dict() for candidate in smart_result.candidates[:3]] if smart_result else [],
             },
             ensure_ascii=False,
         )
@@ -259,6 +327,7 @@ async def resolve_music_url(
             "album": track.album,
             "duration_ms": track.duration * 1000 if track.duration is not None else None,
             "fallback_failures": failures,
+            **(_search_diagnostics(smart_result) if smart_result else {}),
             "elapsed_ms": round((time.monotonic() - started_at) * 1000),
         },
     )

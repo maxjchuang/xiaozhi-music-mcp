@@ -4,6 +4,8 @@
 
 音乐源默认按 `Navidrome → 网易云完整歌曲 → Fangpi → Jamendo → 可选非官方适配器` 的顺序降级。真正的播放仍由 EchoEar 固件内置的 `self.online_music.play_music` 执行。
 
+搜索默认启用 MCP 侧智能候选排序：标准化 ASR 文本，根据标题、拼音、歌手和版本要求评分，再只解析高分候选的播放权限。30 秒试听会保留并标记，高相关试听优先于无关完整歌曲。可在 [`config/music_query_aliases.json`](config/music_query_aliases.json) 中维护高频 ASR 纠错，详细设计见 [`docs/SMART_MUSIC_SEARCH_DESIGN.md`](docs/SMART_MUSIC_SEARCH_DESIGN.md)。
+
 ## 工作方式
 
 ```text
