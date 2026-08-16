@@ -34,6 +34,27 @@ class MusicMcpServerTests(unittest.TestCase):
 
         self.assertNotIn("metadata_url", payload["device_arguments"])
 
+    def test_preview_payload_keeps_playback_compatible_and_adds_notice(self) -> None:
+        track = Track(
+            "netease",
+            "1",
+            "世界真细小",
+            "黄霍",
+            "https://upstream/preview.mp3",
+            duration=30,
+            is_preview=True,
+            preview_duration=30,
+            access_status="membership_required",
+            notice="只有30秒试听",
+        )
+        payload = json.loads(_success_payload(track, "http://lan/preview", "", []))
+
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["is_preview"])
+        self.assertEqual(payload["device_tool"], "self.online_music.play_music")
+        self.assertEqual(payload["assistant_notice"], "只有30秒试听")
+        self.assertEqual(payload["recommended_action"], "netease_relogin")
+
     def test_registration_sends_private_metadata_without_exposing_it_publicly(self) -> None:
         track = Track(
             "unofficial",

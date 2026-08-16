@@ -142,7 +142,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/lyric?", requested_urls[2])
         self.assertEqual(get_json.call_count, 3)
 
-    async def test_netease_skips_trial_stream_and_returns_next_complete_song(self) -> None:
+    async def test_netease_preserves_matching_trial_stream(self) -> None:
         responses = [
             {
                 "code": 200,
@@ -164,30 +164,20 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ],
             },
-            {
-                "code": 200,
-                "data": [
-                    {
-                        "id": 2,
-                        "url": "https://music.example/full.mp3",
-                        "time": 180000,
-                        "freeTrialInfo": None,
-                    }
-                ],
-            },
-            {"code": 200, "lrc": {"lyric": "[00:00.00]完整歌曲"}},
+            {"code": 200, "lrc": {"lyric": "[00:00.00]试听歌曲"}},
         ]
         provider = NeteaseProvider("http://127.0.0.1:3000")
         with patch("music_providers._get_json", side_effect=responses) as get_json:
             tracks = await provider.search("试听歌曲")
 
         self.assertEqual(len(tracks), 1)
-        self.assertEqual(tracks[0].track_id, "2")
-        self.assertEqual(tracks[0].audio_url, "https://music.example/full.mp3")
-        self.assertFalse(tracks[0].is_preview)
-        self.assertEqual(get_json.call_count, 4)
+        self.assertEqual(tracks[0].track_id, "1")
+        self.assertEqual(tracks[0].audio_url, "https://music.example/trial.mp3")
+        self.assertTrue(tracks[0].is_preview)
+        self.assertEqual(tracks[0].preview_duration, 30)
+        self.assertEqual(get_json.call_count, 3)
 
-    async def test_netease_filters_truncated_stream_without_trial_metadata(self) -> None:
+    async def test_netease_marks_truncated_stream_as_preview(self) -> None:
         responses = [
             {
                 "code": 200,
@@ -197,12 +187,15 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 "code": 200,
                 "data": [{"id": 1, "url": "https://music.example/30s.mp3", "time": 30000}],
             },
+            {"code": 200, "lrc": {"lyric": ""}},
         ]
         provider = NeteaseProvider("http://127.0.0.1:3000")
         with patch("music_providers._get_json", side_effect=responses):
             tracks = await provider.search("短试听")
 
-        self.assertEqual(tracks, [])
+        self.assertEqual(len(tracks), 1)
+        self.assertTrue(tracks[0].is_preview)
+        self.assertEqual(tracks[0].preview_duration, 30)
 
     async def test_fangpi_resolves_public_track_to_audio_url(self) -> None:
         search_html = '''

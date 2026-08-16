@@ -93,7 +93,7 @@ verify_updated_installation() {
         'import fastmcp, mcp, pydantic, dotenv, websockets, curl_cffi, mcp_pipe, music_mcp_server, usage_analytics, lark_cli, feishu_sync; from PIL import Image'
     "${PYTHON_BIN}" -m unittest -v \
         test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
-        test_provider_manager.py test_netease_account.py test_usage_analytics.py \
+        test_provider_manager.py test_netease_account.py test_music_search.py test_usage_analytics.py \
         test_lark_cli.py test_feishu_sync.py
 }
 

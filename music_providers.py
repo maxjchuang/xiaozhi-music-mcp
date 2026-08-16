@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 from html import unescape
 import json
@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import ssl
+import time
 from typing import Any, Protocol
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.request import Request, urlopen
@@ -23,6 +24,7 @@ from curl_cffi import requests as curl_requests
 
 LOGGER = logging.getLogger("xiaozhi-music-providers")
 DEFAULT_TIMEOUT_SECONDS = 5.0
+NETEASE_ACCOUNT_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 class ProviderError(RuntimeError):
@@ -43,6 +45,11 @@ class Track:
     lyrics: str = ""
     lyrics_url: str = ""
     is_preview: bool = False
+    preview_duration: int | None = None
+    fee: int | None = None
+    payed: int | None = None
+    access_status: str = "full"
+    notice: str = ""
 
     def public_dict(self) -> dict[str, Any]:
         """Return metadata safe to expose to the assistant and logs."""
@@ -53,10 +60,28 @@ class Track:
         return value
 
 
+@dataclass(frozen=True, slots=True)
+class TrackCandidate:
+    provider: str
+    track_id: str
+    title: str
+    artist: str
+    album: str = ""
+    duration: int | None = None
+    artwork_url: str = ""
+    source_rank: int = 0
+    query: str = ""
+    extra: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+
 class MusicProvider(Protocol):
     name: str
 
     async def search(self, query: str, limit: int = 5) -> list[Track]: ...
+
+    async def search_candidates(self, query: str, limit: int = 10) -> list[TrackCandidate]: ...
+
+    async def resolve_candidate(self, candidate: TrackCandidate) -> Track | None: ...
 
 
 def _verified_ssl_context() -> ssl.SSLContext:
@@ -123,7 +148,7 @@ class NavidromeProvider:
         query.update({key: str(value) for key, value in params.items()})
         return urljoin(self.base_url, f"rest/{method}") + "?" + urlencode(query)
 
-    async def search(self, query: str, limit: int = 5) -> list[Track]:
+    async def search_candidates(self, query: str, limit: int = 10) -> list[TrackCandidate]:
         url = self._api_url(
             "search3",
             query=query,
@@ -137,29 +162,49 @@ class NavidromeProvider:
             error = root.get("error", {})
             raise ProviderError(error.get("message", "Navidrome request failed"))
         songs = root.get("searchResult3", {}).get("song", [])
-        tracks: list[Track] = []
-        for song in songs if isinstance(songs, list) else []:
+        candidates: list[TrackCandidate] = []
+        for rank, song in enumerate(songs if isinstance(songs, list) else []):
             track_id = str(song.get("id", ""))
             title = str(song.get("title", "")).strip()
             if not track_id or not title:
                 continue
-            tracks.append(
-                Track(
+            candidates.append(
+                TrackCandidate(
                     provider=self.name,
                     track_id=track_id,
                     title=title,
                     artist=str(song.get("artist", "未知歌手")),
                     album=str(song.get("album", "")),
                     duration=_optional_int(song.get("duration")),
-                    content_type="audio/mpeg",
                     artwork_url=self._api_url("getCoverArt", id=str(song.get("coverArt", "")))
                     if song.get("coverArt")
                     else "",
-                    lyrics=await self._lyrics(track_id),
-                    audio_url=self._api_url("stream", id=track_id, format="mp3", maxBitRate=192),
+                    source_rank=rank,
+                    query=query,
                 )
             )
-            return tracks
+        return candidates
+
+    async def resolve_candidate(self, candidate: TrackCandidate) -> Track | None:
+        return Track(
+            provider=self.name,
+            track_id=candidate.track_id,
+            title=candidate.title,
+            artist=candidate.artist,
+            album=candidate.album,
+            duration=candidate.duration,
+            content_type="audio/mpeg",
+            artwork_url=candidate.artwork_url,
+            lyrics=await self._lyrics(candidate.track_id),
+            audio_url=self._api_url("stream", id=candidate.track_id, format="mp3", maxBitRate=192),
+        )
+
+    async def search(self, query: str, limit: int = 5) -> list[Track]:
+        tracks: list[Track] = []
+        for candidate in await self.search_candidates(query, limit):
+            if track := await self.resolve_candidate(candidate):
+                tracks.append(track)
+                break
         return tracks
 
     async def _lyrics(self, track_id: str) -> str:
@@ -200,7 +245,7 @@ class JamendoProvider:
         self.client_id = client_id
         self.timeout = timeout
 
-    async def search(self, query: str, limit: int = 5) -> list[Track]:
+    async def search_candidates(self, query: str, limit: int = 10) -> list[TrackCandidate]:
         params = {
             "client_id": self.client_id,
             "format": "json",
@@ -215,25 +260,50 @@ class JamendoProvider:
         headers = payload.get("headers", {}) if isinstance(payload, dict) else {}
         if headers.get("status") != "success":
             raise ProviderError(headers.get("error_message", "Jamendo request failed"))
-        tracks: list[Track] = []
-        for item in payload.get("results", []):
+        candidates: list[TrackCandidate] = []
+        for rank, item in enumerate(payload.get("results", [])):
             audio_url = str(item.get("audio", "")).strip()
             title = str(item.get("name", "")).strip()
             if not audio_url or not title:
                 continue
-            tracks.append(
-                Track(
+            candidates.append(
+                TrackCandidate(
                     provider=self.name,
                     track_id=str(item.get("id", "")),
                     title=title,
                     artist=str(item.get("artist_name", "未知歌手")),
                     album=str(item.get("album_name", "")),
                     duration=_optional_int(item.get("duration")),
-                    content_type="audio/mpeg",
                     artwork_url=str(item.get("image", "")),
-                    audio_url=audio_url,
+                    source_rank=rank,
+                    query=query,
+                    extra={"audio_url": audio_url},
                 )
             )
+        return candidates
+
+    async def resolve_candidate(self, candidate: TrackCandidate) -> Track | None:
+        audio_url = str(candidate.extra.get("audio_url", ""))
+        if not audio_url:
+            return None
+        return Track(
+            provider=self.name,
+            track_id=candidate.track_id,
+            title=candidate.title,
+            artist=candidate.artist,
+            album=candidate.album,
+            duration=candidate.duration,
+            content_type="audio/mpeg",
+            artwork_url=candidate.artwork_url,
+            audio_url=audio_url,
+        )
+
+    async def search(self, query: str, limit: int = 5) -> list[Track]:
+        tracks: list[Track] = []
+        for candidate in await self.search_candidates(query, limit):
+            if track := await self.resolve_candidate(candidate):
+                tracks.append(track)
+                break
         return tracks
 
 
@@ -256,8 +326,8 @@ class NeteaseProvider:
             {key: str(value) for key, value in params.items()}
         )
 
-    async def search(self, query: str, limit: int = 5) -> list[Track]:
-        result_limit = max(1, min(limit, 10))
+    async def search_candidates(self, query: str, limit: int = 10) -> list[TrackCandidate]:
+        result_limit = max(1, min(limit, 20))
         search_url = self._api_url(
             "cloudsearch",
             keywords=query,
@@ -271,8 +341,8 @@ class NeteaseProvider:
         if not isinstance(songs, list):
             raise ProviderError("NetEase search returned an invalid payload")
 
-        tracks: list[Track] = []
-        for song in songs[:result_limit]:
+        candidates: list[TrackCandidate] = []
+        for rank, song in enumerate(songs[:result_limit]):
             if not isinstance(song, dict):
                 continue
             track_id = str(song.get("id", "")).strip()
@@ -280,32 +350,7 @@ class NeteaseProvider:
             if not track_id or not title:
                 continue
 
-            stream_url = self._api_url(
-                "song/url/v1",
-                id=track_id,
-                level="standard",
-            )
-            stream_payload = await asyncio.to_thread(_get_json, stream_url, self.timeout)
-            stream_items = stream_payload.get("data", []) if isinstance(stream_payload, dict) else []
-            stream = stream_items[0] if isinstance(stream_items, list) and stream_items else {}
-            if not isinstance(stream, dict):
-                continue
-            audio_url = str(stream.get("url") or "").strip()
-            if not audio_url or urlsplit(audio_url).scheme not in {"http", "https"}:
-                continue
-
             duration_ms = _optional_int(song.get("dt"))
-            stream_duration_ms = _optional_int(stream.get("time"))
-            has_trial_metadata = stream.get("freeTrialInfo") is not None or stream.get("trialInfo") is not None
-            has_truncated_duration = bool(
-                duration_ms
-                and stream_duration_ms
-                and stream_duration_ms + 1000 < duration_ms
-            )
-            if has_trial_metadata or has_truncated_duration:
-                LOGGER.info("跳过网易云试听歌曲：%s (id=%s)", title, track_id)
-                continue
-
             artists = song.get("ar", [])
             artist = "/".join(
                 str(item.get("name", "")).strip()
@@ -313,25 +358,99 @@ class NeteaseProvider:
                 if isinstance(item, dict) and item.get("name")
             )
             album = song.get("al", {})
-            audio_type = str(stream.get("type", "mp3")).lower()
-            tracks.append(
-                Track(
+            candidates.append(
+                TrackCandidate(
                     provider=self.name,
                     track_id=track_id,
                     title=title,
                     artist=artist or "未知歌手",
                     album=str(album.get("name", "")) if isinstance(album, dict) else "",
                     duration=duration_ms // 1000 if duration_ms else None,
-                    content_type="audio/flac" if audio_type == "flac" else "audio/mpeg",
                     artwork_url=str(album.get("picUrl", "")) if isinstance(album, dict) else "",
-                    lyrics=await self._lyrics(track_id),
-                    audio_url=audio_url,
+                    source_rank=rank,
+                    query=query,
+                    extra={"fee": _optional_int(song.get("fee"))},
                 )
             )
-            # ProviderChain consumes only the first playable result. Returning
-            # immediately avoids resolving up to nine unused stream URLs and
-            # keeps voice requests comfortably inside the provider timeout.
-            return tracks
+        return candidates
+
+    async def resolve_candidate(self, candidate: TrackCandidate) -> Track | None:
+        stream_url = self._api_url("song/url/v1", id=candidate.track_id, level="standard")
+        stream_payload = await asyncio.to_thread(_get_json, stream_url, self.timeout)
+        stream_items = stream_payload.get("data", []) if isinstance(stream_payload, dict) else []
+        stream = stream_items[0] if isinstance(stream_items, list) and stream_items else {}
+        if not isinstance(stream, dict):
+            return None
+        audio_url = str(stream.get("url") or "").strip()
+        if not audio_url or urlsplit(audio_url).scheme not in {"http", "https"}:
+            return None
+
+        stream_duration_ms = _optional_int(stream.get("time"))
+        original_duration_ms = candidate.duration * 1000 if candidate.duration else None
+        has_trial_metadata = stream.get("freeTrialInfo") is not None or stream.get("trialInfo") is not None
+        has_truncated_duration = bool(
+            original_duration_ms
+            and stream_duration_ms
+            and stream_duration_ms + 1000 < original_duration_ms
+        )
+        is_preview = has_trial_metadata or has_truncated_duration
+        preview_duration = stream_duration_ms // 1000 if is_preview and stream_duration_ms else None
+        fee = _optional_int(stream.get("fee"))
+        if fee is None:
+            fee = _optional_int(candidate.extra.get("fee"))
+        payed = _optional_int(stream.get("payed"))
+        access_status = "membership_required" if is_preview and fee == 1 and not payed else (
+            "preview_only" if is_preview else "full"
+        )
+        audio_type = str(stream.get("type", "mp3")).lower()
+        if is_preview:
+            LOGGER.info("保留网易云试听歌曲：%s (id=%s duration=%s)", candidate.title, candidate.track_id, preview_duration)
+        return Track(
+            provider=self.name,
+            track_id=candidate.track_id,
+            title=candidate.title,
+            artist=candidate.artist,
+            album=candidate.album,
+            duration=preview_duration if is_preview and preview_duration else candidate.duration,
+            content_type="audio/flac" if audio_type == "flac" else "audio/mpeg",
+            artwork_url=candidate.artwork_url,
+            lyrics=await self._lyrics(candidate.track_id),
+            audio_url=audio_url,
+            is_preview=is_preview,
+            preview_duration=preview_duration,
+            fee=fee,
+            payed=payed,
+            access_status=access_status,
+        )
+
+    async def account_status(self) -> dict[str, Any]:
+        cached = NETEASE_ACCOUNT_STATUS_CACHE.get(self.base_url)
+        if cached and cached[0] > time.monotonic():
+            return dict(cached[1])
+        try:
+            payload = await asyncio.to_thread(
+                _get_json,
+                self._api_url("login/status", timestamp=int(time.time() * 1000)),
+                min(self.timeout, 5),
+            )
+        except ProviderError as exc:
+            return {"status": "unknown", "reason": str(exc)}
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        account = data.get("account", {}) if isinstance(data, dict) else {}
+        profile = data.get("profile", {}) if isinstance(data, dict) else {}
+        user_id = (profile.get("userId") if isinstance(profile, dict) else None) or (
+            account.get("id") if isinstance(account, dict) else None
+        )
+        result = {"status": "logged_in" if user_id else "login_required", "user_id": str(user_id or "")}
+        NETEASE_ACCOUNT_STATUS_CACHE[self.base_url] = (time.monotonic() + 300, result)
+        return dict(result)
+
+    async def search(self, query: str, limit: int = 5) -> list[Track]:
+        tracks: list[Track] = []
+        for candidate in await self.search_candidates(query, limit):
+            if track := await self.resolve_candidate(candidate):
+                tracks.append(track)
+                break
         return tracks
 
     async def _lyrics(self, track_id: str) -> str:
@@ -431,49 +550,65 @@ class FangpiProvider:
         except (curl_requests.RequestsError, ValueError) as exc:
             raise ProviderError(str(exc)) from exc
 
-    def _search_sync(self, query: str, limit: int) -> list[Track]:
+    def _search_candidates_sync(self, query: str, limit: int) -> list[TrackCandidate]:
         search_url = self.base_url + "/s/" + quote(query, safe="")
         results = _parse_fangpi_search_results(self._get_text(search_url), self.base_url)
-        for result in results[: max(1, min(limit, 5))]:
-            try:
-                metadata = _parse_fangpi_app_data(self._get_text(result["url"]))
-                play_id = str(metadata.get("play_id") or "").strip()
-                if not play_id:
-                    continue
-                payload = self._post_json(
-                    self.base_url + "/member/common-play-url",
-                    {"id": play_id},
-                )
-                data = payload.get("data", {}) if isinstance(payload, dict) else {}
-                audio_url = str(data.get("url") or "").replace("\\/", "/").strip()
-                if urlsplit(audio_url).scheme not in {"http", "https"}:
-                    continue
-                duration_text = str(metadata.get("mp3_duration") or "")
-                duration_parts = [int(value) for value in re.findall(r"\d+", duration_text)]
-                duration = None
-                if len(duration_parts) == 2:
-                    duration = duration_parts[0] * 60 + duration_parts[1]
-                elif len(duration_parts) == 3:
-                    duration = duration_parts[0] * 3600 + duration_parts[1] * 60 + duration_parts[2]
-                return [
-                    Track(
-                        provider=self.name,
-                        track_id=str(metadata.get("mp3_id") or result["id"]),
-                        title=str(metadata.get("mp3_title") or result["title"]).strip(),
-                        artist=str(metadata.get("mp3_author") or result["artist"]).strip(),
-                        duration=duration,
-                        content_type="audio/mpeg",
-                        artwork_url=str(metadata.get("mp3_cover") or "").replace("\\/", "/"),
-                        lyrics=str(metadata.get("mp3_lyric") or metadata.get("lyric") or ""),
-                        audio_url=audio_url,
-                    )
-                ]
-            except ProviderError as exc:
-                LOGGER.info("Fangpi 候选歌曲解析失败：%s", exc)
-        return []
+        return [
+            TrackCandidate(
+                provider=self.name,
+                track_id=result["id"],
+                title=result["title"],
+                artist=result["artist"],
+                source_rank=rank,
+                query=query,
+                extra={"track_url": result["url"]},
+            )
+            for rank, result in enumerate(results[: max(1, min(limit, 10))])
+        ]
+
+    def _resolve_candidate_sync(self, candidate: TrackCandidate) -> Track | None:
+        metadata = _parse_fangpi_app_data(self._get_text(str(candidate.extra.get("track_url", ""))))
+        play_id = str(metadata.get("play_id") or "").strip()
+        if not play_id:
+            return None
+        payload = self._post_json(self.base_url + "/member/common-play-url", {"id": play_id})
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        audio_url = str(data.get("url") or "").replace("\\/", "/").strip()
+        if urlsplit(audio_url).scheme not in {"http", "https"}:
+            return None
+        duration_parts = [int(value) for value in re.findall(r"\d+", str(metadata.get("mp3_duration") or ""))]
+        duration = None
+        if len(duration_parts) == 2:
+            duration = duration_parts[0] * 60 + duration_parts[1]
+        elif len(duration_parts) == 3:
+            duration = duration_parts[0] * 3600 + duration_parts[1] * 60 + duration_parts[2]
+        return Track(
+            provider=self.name,
+            track_id=str(metadata.get("mp3_id") or candidate.track_id),
+            title=str(metadata.get("mp3_title") or candidate.title).strip(),
+            artist=str(metadata.get("mp3_author") or candidate.artist).strip(),
+            duration=duration,
+            content_type="audio/mpeg",
+            artwork_url=str(metadata.get("mp3_cover") or "").replace("\\/", "/"),
+            lyrics=str(metadata.get("mp3_lyric") or metadata.get("lyric") or ""),
+            audio_url=audio_url,
+        )
+
+    async def search_candidates(self, query: str, limit: int = 10) -> list[TrackCandidate]:
+        return await asyncio.to_thread(self._search_candidates_sync, query, limit)
+
+    async def resolve_candidate(self, candidate: TrackCandidate) -> Track | None:
+        try:
+            return await asyncio.to_thread(self._resolve_candidate_sync, candidate)
+        except ProviderError as exc:
+            LOGGER.info("Fangpi 候选歌曲解析失败：%s", exc)
+            return None
 
     async def search(self, query: str, limit: int = 5) -> list[Track]:
-        return await asyncio.to_thread(self._search_sync, query, limit)
+        for candidate in await self.search_candidates(query, limit):
+            if track := await self.resolve_candidate(candidate):
+                return [track]
+        return []
 
 
 class HttpJsonProvider:
@@ -491,7 +626,7 @@ class HttpJsonProvider:
         self.token = token
         self.timeout = timeout
 
-    async def search(self, query: str, limit: int = 5) -> list[Track]:
+    async def search_candidates(self, query: str, limit: int = 10) -> list[TrackCandidate]:
         separator = "&" if "?" in self.endpoint else "?"
         url = self.endpoint + separator + urlencode({"q": query, "limit": limit})
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else None
@@ -499,29 +634,59 @@ class HttpJsonProvider:
         items = payload.get("tracks", []) if isinstance(payload, dict) else payload
         if not isinstance(items, list):
             raise ProviderError("unofficial provider returned an invalid payload")
-        tracks: list[Track] = []
-        for item in items:
+        candidates: list[TrackCandidate] = []
+        for rank, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
             audio_url = str(item.get("audio_url", "")).strip()
             title = str(item.get("title", "")).strip()
             if not audio_url or not title or urlsplit(audio_url).scheme not in {"http", "https"}:
                 continue
-            tracks.append(
-                Track(
+            candidates.append(
+                TrackCandidate(
                     provider=self.name,
                     track_id=str(item.get("id", "")),
                     title=title,
                     artist=str(item.get("artist", "未知歌手")),
                     album=str(item.get("album", "")),
                     duration=_optional_int(item.get("duration")),
-                    content_type=str(item.get("content_type", "audio/mpeg")),
                     artwork_url=str(item.get("artwork_url", "")),
-                    lyrics=str(item.get("lyrics") or item.get("lyric") or ""),
-                    lyrics_url=str(item.get("lyrics_url") or item.get("lyric_url") or ""),
-                    audio_url=audio_url,
+                    source_rank=rank,
+                    query=query,
+                    extra={
+                        "audio_url": audio_url,
+                        "content_type": str(item.get("content_type", "audio/mpeg")),
+                        "lyrics": str(item.get("lyrics") or item.get("lyric") or ""),
+                        "lyrics_url": str(item.get("lyrics_url") or item.get("lyric_url") or ""),
+                    },
                 )
             )
+        return candidates
+
+    async def resolve_candidate(self, candidate: TrackCandidate) -> Track | None:
+        audio_url = str(candidate.extra.get("audio_url", ""))
+        if not audio_url:
+            return None
+        return Track(
+            provider=self.name,
+            track_id=candidate.track_id,
+            title=candidate.title,
+            artist=candidate.artist,
+            album=candidate.album,
+            duration=candidate.duration,
+            content_type=str(candidate.extra.get("content_type", "audio/mpeg")),
+            artwork_url=candidate.artwork_url,
+            lyrics=str(candidate.extra.get("lyrics", "")),
+            lyrics_url=str(candidate.extra.get("lyrics_url", "")),
+            audio_url=audio_url,
+        )
+
+    async def search(self, query: str, limit: int = 5) -> list[Track]:
+        tracks: list[Track] = []
+        for candidate in await self.search_candidates(query, limit):
+            if track := await self.resolve_candidate(candidate):
+                tracks.append(track)
+                break
         return tracks
 
 
