@@ -187,7 +187,8 @@ if [[ "${skip_tests}" == "false" ]]; then
     info "运行本地测试"
     "${VENV_PYTHON}" -m unittest -v \
         test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
-        test_provider_manager.py test_usage_analytics.py test_lark_cli.py test_feishu_sync.py
+        test_provider_manager.py test_netease_account.py test_usage_analytics.py \
+        test_lark_cli.py test_feishu_sync.py
     "${VENV_PYTHON}" test_mcp.py
     "${VENV_PYTHON}" test_mcp_pipe.py
 else

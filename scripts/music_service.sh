@@ -15,6 +15,7 @@ AUTOSTART_PLIST="${USER_LAUNCH_AGENTS}/${SERVICE_LABEL}.plist"
 RUNTIME_DIR="${HOME}/Library/Application Support/xiaozhi-music-mcp"
 RUNTIME_PLIST="${RUNTIME_DIR}/${SERVICE_LABEL}.plist"
 PROVIDER_MANAGER="${PROJECT_ROOT}/scripts/provider_manager.py"
+NETEASE_ACCOUNT_MANAGER="${PROJECT_ROOT}/scripts/netease_account.py"
 PROVIDER_LOG_DIR="${HOME}/.local/state/xiaozhi/logs"
 
 usage() {
@@ -33,6 +34,7 @@ usage() {
   logs                持续查看服务日志，按 Ctrl+C 退出
   auth <命令>         飞书登录管理：status、login、logout
   analytics <命令>    行为统计管理：init、status、sync、retry、test
+  netease <命令>      网易云账号管理：status、login、logout、relogin
 EOF
 }
 
@@ -47,7 +49,7 @@ validate_installation() {
         exit 1
     fi
     if [[ ! -f "${PROJECT_ROOT}/mcp_pipe.py" || ! -f "${TEMPLATE_PATH}" ||
-          ! -f "${PROVIDER_MANAGER}" ]]; then
+          ! -f "${PROVIDER_MANAGER}" || ! -f "${NETEASE_ACCOUNT_MANAGER}" ]]; then
         echo "错误：项目文件不完整。" >&2
         exit 1
     fi
@@ -91,7 +93,8 @@ verify_updated_installation() {
         'import fastmcp, mcp, pydantic, dotenv, websockets, curl_cffi, mcp_pipe, music_mcp_server, usage_analytics, lark_cli, feishu_sync; from PIL import Image'
     "${PYTHON_BIN}" -m unittest -v \
         test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
-        test_provider_manager.py test_usage_analytics.py test_lark_cli.py test_feishu_sync.py
+        test_provider_manager.py test_netease_account.py test_usage_analytics.py \
+        test_lark_cli.py test_feishu_sync.py
 }
 
 finish_update() {
@@ -176,6 +179,34 @@ remove_provider_autostart() {
 
 show_provider_status() {
     "${PYTHON_BIN}" "${PROVIDER_MANAGER}" status
+}
+
+manage_netease_account() {
+    local action="${1:-status}"
+    case "${action}" in
+        status)
+            "${PYTHON_BIN}" "${NETEASE_ACCOUNT_MANAGER}" status
+            ;;
+        login|relogin)
+            start_providers
+            "${PYTHON_BIN}" "${NETEASE_ACCOUNT_MANAGER}" "${action}"
+            echo "网易云登录凭据已更新，正在重载托管 Provider……"
+            stop_providers
+            start_providers
+            "${PYTHON_BIN}" "${NETEASE_ACCOUNT_MANAGER}" status
+            ;;
+        logout)
+            "${PYTHON_BIN}" "${NETEASE_ACCOUNT_MANAGER}" logout
+            echo "网易云登录凭据已清除，正在重载托管 Provider……"
+            stop_providers
+            start_providers
+            ;;
+        *)
+            echo "错误：未知网易云命令 ${action}" >&2
+            echo "用法：bash scripts/music_service.sh netease {status|login|logout|relogin}" >&2
+            return 2
+            ;;
+    esac
 }
 
 escape_sed_replacement() {
@@ -388,6 +419,10 @@ case "${command_name}" in
     analytics)
         validate_installation
         "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/analytics_manager.py" analytics "${2:-status}"
+        ;;
+    netease)
+        validate_installation
+        manage_netease_account "${2:-status}"
         ;;
     -h|--help|help|"")
         usage

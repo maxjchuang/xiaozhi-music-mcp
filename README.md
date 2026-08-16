@@ -287,6 +287,26 @@ ENABLE_GENERAL_UNBLOCK=false
 
 网易云登录态保存在这个独立服务的 `.env` 中，而不是本仓库。可以安全迁移原来的 `NETEASE_COOKIE=MUSIC_U=...`，也可以在新电脑重新扫码登录。启动后先验证搜索接口：
 
+已完成 Provider 配置后，可以通过统一服务命令管理网易云账号：
+
+```bash
+# 查看当前登录状态
+bash scripts/music_service.sh netease status
+
+# 扫码登录；成功后自动保存 Cookie 并重载 Provider
+bash scripts/music_service.sh netease login
+
+# 退出并清除本机 Cookie
+bash scripts/music_service.sh netease logout
+
+# 退出当前账号后立即扫码登录新账号
+bash scripts/music_service.sh netease relogin
+```
+
+`login` 和 `relogin` 会自动打开二维码图片，且不会在终端或日志中输出完整 Cookie。
+
+也可以手动启动 API 并验证搜索接口：
+
 ```bash
 cd ~/.local/share/xiaozhi/netease-api-enhanced
 npm start
