@@ -92,7 +92,7 @@ verify_updated_installation() {
     "${PYTHON_BIN}" -c \
         'import fastmcp, mcp, pydantic, dotenv, websockets, curl_cffi, mcp_pipe, music_mcp_server, usage_analytics, lark_cli, feishu_sync; from PIL import Image'
     "${PYTHON_BIN}" -m unittest -v \
-        test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
+        test_music_providers.py test_audio_proxy.py test_music_mcp_server.py test_analytics_manager.py \
         test_provider_manager.py test_netease_account.py test_music_search.py test_usage_analytics.py \
         test_lark_cli.py test_feishu_sync.py
 }
@@ -418,7 +418,11 @@ case "${command_name}" in
         ;;
     analytics)
         validate_installation
-        "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/analytics_manager.py" analytics "${2:-status}"
+        if [[ $# -ge 2 ]]; then
+            "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/analytics_manager.py" analytics "${@:2}"
+        else
+            "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/analytics_manager.py" analytics status
+        fi
         ;;
     netease)
         validate_installation

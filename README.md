@@ -220,7 +220,15 @@ bash scripts/music_service.sh analytics init
 bash scripts/music_service.sh analytics test
 ```
 
-`auth login` 会调用 `lark-cli auth login --domain base`，按 CLI 提示完成 Device Flow 授权。Token 的存储和刷新由 CLI 管理，项目不会读取 Token。`analytics init` 会创建或校验“原始事件”表和“小智使用分析”仪表盘，并将表 ID、仪表盘 ID 写入权限为 `0600` 的 `.env`。
+`auth login` 会调用 `lark-cli auth login --domain base`，按 CLI 提示完成 Device Flow 授权。Token 的存储和刷新由 CLI 管理，项目不会读取 Token。
+
+如果没有配置 `FEISHU_BASE_TOKEN`，交互式执行 `analytics init` 会询问是否自动创建并初始化“小智使用分析”多维表格；确认后会复用并重命名飞书自动生成的首张数据表，不留下无用表。非交互部署可显式执行：
+
+```bash
+bash scripts/music_service.sh analytics init --create-base
+```
+
+也可以通过 `--base-name "家庭小智分析"` 自定义名称。初始化完成后，Base Token、表 ID 和仪表盘 ID 会写入权限为 `0600` 的 `.env`。
 
 ### 3. 日常管理
 

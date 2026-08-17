@@ -132,6 +132,38 @@ class FeishuBaseClient:
             source.get("FEISHU_EVENT_TABLE_ID", ""),
         )
 
+    @classmethod
+    def create_base(
+        cls, name: str, *, cli: LarkCli | None = None
+    ) -> tuple["FeishuBaseClient", str, str]:
+        selected_cli = cli or LarkCli()
+        result = selected_cli.run(
+            [
+                "base", "+base-create", "--name", name,
+                "--time-zone", "Asia/Shanghai", "--as", "user",
+            ],
+            timeout=60,
+        )
+        data = _data(result)
+        resource = data.get("base") or data.get("app") or {}
+        if not isinstance(resource, Mapping):
+            resource = {}
+        base_token = str(
+            data.get("base_token")
+            or data.get("app_token")
+            or resource.get("base_token")
+            or resource.get("app_token")
+            or resource.get("token")
+            or ""
+        )
+        default_table_id = str(
+            data.get("default_table_id") or resource.get("default_table_id") or ""
+        )
+        base_url = str(data.get("url") or resource.get("url") or "")
+        if not base_token:
+            raise FeishuApiError("飞书 CLI 创建成功但没有返回 Base Token")
+        return cls(selected_cli, base_token), default_table_id, base_url
+
     def validate_access(self) -> None:
         self.cli.run(["base", "+table-list", "--base-token", self.base_token, "--as", "user"])
 
@@ -154,8 +186,19 @@ class FeishuBaseClient:
         )
         return {event.event_id: "" for event in events}
 
-    def initialize(self) -> tuple[str, str]:
+    def initialize(
+        self, *, fresh_base: bool = False, default_table_id: str = ""
+    ) -> tuple[str, str]:
         tables = _data(self.cli.run(["base", "+table-list", "--base-token", self.base_token, "--as", "user"])).get("tables", [])
+        if fresh_base:
+            initial_table_id = default_table_id
+            if not initial_table_id and len(tables) == 1:
+                initial_table_id = str(tables[0].get("id", tables[0].get("table_id", "")))
+            if not initial_table_id:
+                raise FeishuApiError("新建多维表格没有返回默认数据表 ID")
+            self._prepare_initial_event_table(initial_table_id)
+            self.event_table_id = initial_table_id
+            return initial_table_id, self._ensure_dashboard()
         table = next((item for item in tables if item.get("name") == "原始事件"), None)
         if table is None:
             created = self.cli.run(
@@ -172,9 +215,41 @@ class FeishuBaseClient:
         self.event_table_id = table_id
         return table_id, self._ensure_dashboard()
 
-    def _ensure_fields(self, table_id: str) -> None:
-        result = self.cli.run(["base", "+field-list", "--base-token", self.base_token, "--table-id", table_id, "--as", "user"])
-        existing = {item.get("name", item.get("field_name")) for item in _data(result).get("fields", [])}
+    def _prepare_initial_event_table(self, table_id: str) -> None:
+        self.cli.run(
+            [
+                "base", "+table-update", "--base-token", self.base_token,
+                "--table-id", table_id, "--name", "原始事件", "--as", "user",
+            ]
+        )
+        result = self.cli.run(
+            [
+                "base", "+field-list", "--base-token", self.base_token,
+                "--table-id", table_id, "--as", "user",
+            ]
+        )
+        fields = list(_data(result).get("fields", []))
+        existing = {item.get("name", item.get("field_name")) for item in fields}
+        if "事件ID" not in existing and fields:
+            primary = fields[0]
+            field_id = str(primary.get("id", primary.get("field_id", "")))
+            if not field_id:
+                raise FeishuApiError("新建多维表格的默认主字段没有返回 ID")
+            self.cli.run(
+                [
+                    "base", "+field-update", "--base-token", self.base_token,
+                    "--table-id", table_id, "--field-id", field_id,
+                    "--json", json.dumps(EVENT_TABLE_FIELDS[0], ensure_ascii=False),
+                    "--as", "user", "--yes",
+                ]
+            )
+            existing.add("事件ID")
+        self._ensure_fields(table_id, existing=existing)
+
+    def _ensure_fields(self, table_id: str, *, existing: set[object] | None = None) -> None:
+        if existing is None:
+            result = self.cli.run(["base", "+field-list", "--base-token", self.base_token, "--table-id", table_id, "--as", "user"])
+            existing = {item.get("name", item.get("field_name")) for item in _data(result).get("fields", [])}
         for field in EVENT_TABLE_FIELDS:
             if field["name"] in existing:
                 continue

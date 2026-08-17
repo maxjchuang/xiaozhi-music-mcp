@@ -159,10 +159,34 @@ def set_project_env(values: dict[str, str]) -> None:
     path.chmod(0o600)
 
 
-def analytics_init() -> int:
+def analytics_init(*, create_base: bool = False, base_name: str = "小智使用分析") -> int:
+    base_token = os.getenv("FEISHU_BASE_TOKEN", "").strip()
+    created_base_url = ""
     try:
-        client = FeishuBaseClient.from_env()
-        table_id, dashboard_id = client.initialize()
+        if base_token:
+            client = FeishuBaseClient.from_env()
+            table_id, dashboard_id = client.initialize()
+        else:
+            should_create = create_base
+            if not should_create:
+                if not sys.stdin.isatty():
+                    print(
+                        "初始化失败：缺少 FEISHU_BASE_TOKEN。非交互模式下可添加 "
+                        "--create-base 自动创建多维表格。",
+                        file=sys.stderr,
+                    )
+                    return 3
+                answer = input(
+                    f"尚未配置 FEISHU_BASE_TOKEN，是否自动创建并初始化多维表格“{base_name}”？[Y/n] "
+                ).strip().lower()
+                should_create = answer in {"", "y", "yes", "是"}
+            if not should_create:
+                print("已取消创建。请配置 FEISHU_BASE_TOKEN 后重新执行 analytics init。")
+                return 2
+            client, default_table_id, created_base_url = FeishuBaseClient.create_base(base_name)
+            table_id, dashboard_id = client.initialize(
+                fresh_base=True, default_table_id=default_table_id
+            )
     except (LarkCliError, FeishuApiError, OSError, ValueError) as exc:
         print(f"初始化失败：{exc}", file=sys.stderr)
         return 3
@@ -177,6 +201,8 @@ def analytics_init() -> int:
     )
     print(f"原始事件表：{table_id}")
     print(f"统计仪表盘：{dashboard_id}")
+    if created_base_url:
+        print(f"多维表格：{created_base_url}")
     print("初始化成功，配置已写入 .env。")
     return 0
 
@@ -194,7 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
     analytics = group.add_parser("analytics")
     analytics_commands = analytics.add_subparsers(dest="command", required=True)
     analytics_commands.add_parser("status")
-    analytics_commands.add_parser("init")
+    initialize = analytics_commands.add_parser("init")
+    initialize.add_argument("--create-base", action="store_true")
+    initialize.add_argument("--base-name", default="小智使用分析")
     analytics_commands.add_parser("retry")
     analytics_commands.add_parser("sync")
     analytics_commands.add_parser("test")
@@ -215,7 +243,10 @@ def main() -> int:
             return auth_preflight(arguments.interactive)
     if arguments.group == "analytics":
         if arguments.command == "init":
-            return analytics_init()
+            return analytics_init(
+                create_base=arguments.create_base,
+                base_name=arguments.base_name,
+            )
         if arguments.command == "status":
             return analytics_status()
         if arguments.command == "retry":
