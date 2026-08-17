@@ -81,6 +81,58 @@ class FeishuSyncTests(unittest.TestCase):
         self.assertEqual((table_id, dashboard_id), ("tbl-existing", "dbs-existing"))
         self.assertEqual(len(cli.calls), 4)
 
+    def test_create_base_extracts_token_default_table_and_url(self) -> None:
+        cli = FakeCli(
+            [
+                {
+                    "ok": True,
+                    "data": {
+                        "app": {
+                            "app_token": "base-created",
+                            "default_table_id": "tbl-default",
+                            "url": "https://example.feishu.cn/base/base-created",
+                        }
+                    },
+                }
+            ]
+        )
+
+        client, table_id, url = FeishuBaseClient.create_base("小智使用分析", cli=cli)  # type: ignore[arg-type]
+
+        self.assertEqual(client.base_token, "base-created")
+        self.assertEqual(table_id, "tbl-default")
+        self.assertEqual(url, "https://example.feishu.cn/base/base-created")
+        arguments = cli.calls[0][0]
+        self.assertEqual(arguments[:2], ["base", "+base-create"])
+        self.assertIn("--as", arguments)
+        self.assertEqual(arguments[arguments.index("--as") + 1], "user")
+
+    def test_fresh_base_reuses_and_renames_default_table(self) -> None:
+        cli = FakeCli(
+            [
+                {"ok": True, "data": {"tables": [{"name": "数据表", "id": "tbl-default"}]}},
+                {"ok": True, "data": {}},
+                {"ok": True, "data": {"fields": [{"id": "fld-primary", "name": "文本"}]}},
+                {"ok": True, "data": {}},
+                *({"ok": True, "data": {}} for _ in EVENT_TABLE_FIELDS[1:]),
+                {"ok": True, "data": {"dashboards": [{"name": "小智使用分析", "id": "dbs-existing"}]}},
+                {"ok": True, "data": {"items": [{"name": block[1]} for block in DASHBOARD_BLOCKS]}},
+            ]
+        )
+        client = FeishuBaseClient(cli, "base-created")  # type: ignore[arg-type]
+
+        table_id, dashboard_id = client.initialize(
+            fresh_base=True, default_table_id="tbl-default"
+        )
+
+        self.assertEqual((table_id, dashboard_id), ("tbl-default", "dbs-existing"))
+        commands = [call[0][1] for call in cli.calls]
+        self.assertIn("+table-update", commands)
+        self.assertIn("+field-update", commands)
+        field_update = next(call[0] for call in cli.calls if call[0][1] == "+field-update")
+        self.assertIn("--yes", field_update)
+        self.assertNotIn("+table-create", commands)
+
 
 if __name__ == "__main__":
     unittest.main()
