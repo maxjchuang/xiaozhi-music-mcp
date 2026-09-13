@@ -87,6 +87,7 @@ REQUIRED_BASE_SCOPES = frozenset(
         "base:app:create",
         "base:record:create",
         "base:record:read",
+        "base:record:update",
         "base:table:create",
         "base:table:read",
         "base:table:update",

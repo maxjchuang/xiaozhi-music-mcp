@@ -78,6 +78,12 @@ def _register_proxy_sync(track: Track, trace_id: str = "") -> tuple[str, str]:
             "artist": track.artist,
             "album": track.album,
             "duration_ms": track.duration * 1000 if track.duration is not None else None,
+            "song_duration_ms": (
+                track.song_duration * 1000
+                if track.song_duration is not None
+                else track.duration * 1000 if track.duration is not None else None
+            ),
+            "playback_access": "preview" if track.is_preview else "full",
             "artwork_url": track.artwork_url,
             "lyrics": track.lyrics,
             "lyrics_url": track.lyrics_url,

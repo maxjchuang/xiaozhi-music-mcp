@@ -33,7 +33,7 @@ usage() {
   disable-autostart   关闭登录自启动；若服务正在运行则保持运行
   logs                持续查看服务日志，按 Ctrl+C 退出
   auth <命令>         飞书登录管理：status、login、logout
-  analytics <命令>    行为统计管理：init、status、sync、retry、test
+  analytics <命令>    行为统计：init、status、sync、retry、test、telemetry-status、rebuild、inspect/query/delete-session、cleanup
   netease <命令>      网易云账号管理：status、login、logout、relogin
 EOF
 }

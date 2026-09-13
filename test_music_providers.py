@@ -17,6 +17,7 @@ from music_providers import (
     ProviderChain,
     ProviderError,
     Track,
+    _netease_artwork_url,
     _parse_fangpi_app_data,
     _parse_fangpi_search_results,
     providers_from_env,
@@ -38,6 +39,16 @@ class FakeProvider(MusicProvider):
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_netease_artwork_requests_bounded_cdn_image(self) -> None:
+        self.assertEqual(
+            _netease_artwork_url("https://p4.music.126.net/a==/cover.jpg"),
+            "https://p4.music.126.net/a==/cover.jpg?param=720y720",
+        )
+        self.assertEqual(
+            _netease_artwork_url("https://img/cover.jpg?quality=90&param=400y400"),
+            "https://img/cover.jpg?quality=90&param=720y720",
+        )
+
     async def test_chain_stops_at_first_provider_with_results(self) -> None:
         local_track = Track("navidrome", "1", "本地歌曲", "歌手", "http://local/1.mp3")
         local = FakeProvider("navidrome", [local_track])
@@ -134,6 +145,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracks[0].provider, "netease")
         self.assertEqual(tracks[0].artist, "Beyond")
         self.assertEqual(tracks[0].duration, 326)
+        self.assertEqual(tracks[0].artwork_url, "https://img/cover.jpg?param=720y720")
         requested_urls = [call.args[0] for call in get_json.call_args_list]
         self.assertIn("/cloudsearch?", requested_urls[0])
         self.assertIn("/song/url/v1?", requested_urls[1])
@@ -175,6 +187,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracks[0].audio_url, "https://music.example/trial.mp3")
         self.assertTrue(tracks[0].is_preview)
         self.assertEqual(tracks[0].preview_duration, 30)
+        self.assertEqual(tracks[0].song_duration, 240)
         self.assertEqual(get_json.call_count, 3)
 
     async def test_netease_marks_truncated_stream_as_preview(self) -> None:
@@ -196,6 +209,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tracks), 1)
         self.assertTrue(tracks[0].is_preview)
         self.assertEqual(tracks[0].preview_duration, 30)
+        self.assertEqual(tracks[0].song_duration, 210)
 
     async def test_fangpi_resolves_public_track_to_audio_url(self) -> None:
         search_html = '''

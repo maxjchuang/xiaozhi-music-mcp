@@ -24,7 +24,9 @@ class AnalyticsManagerTests(unittest.TestCase):
     def test_init_prompts_and_creates_base_when_user_accepts(self) -> None:
         client = MagicMock()
         client.base_token = "base-created"
-        client.initialize.return_value = ("tbl-events", "dbs-dashboard")
+        client.initialize.return_value = (
+            "tbl-events", "tbl-sessions", "tbl-plays", "dbs-dashboard"
+        )
         auth = MagicMock()
         auth.cli.executable = "/usr/local/bin/lark-cli"
         with (
@@ -47,10 +49,14 @@ class AnalyticsManagerTests(unittest.TestCase):
             fresh_base=True, default_table_id="tbl-default"
         )
         self.assertEqual(set_env.call_args.args[0]["FEISHU_BASE_TOKEN"], "base-created")
+        self.assertEqual(set_env.call_args.args[0]["FEISHU_SESSION_TABLE_ID"], "tbl-sessions")
+        self.assertEqual(set_env.call_args.args[0]["FEISHU_PLAY_TABLE_ID"], "tbl-plays")
 
     def test_init_create_base_flag_skips_prompt(self) -> None:
         client = MagicMock(base_token="base-created")
-        client.initialize.return_value = ("tbl-events", "dbs-dashboard")
+        client.initialize.return_value = (
+            "tbl-events", "tbl-sessions", "tbl-plays", "dbs-dashboard"
+        )
         auth = MagicMock()
         auth.cli.executable = "/usr/local/bin/lark-cli"
         with (
@@ -67,7 +73,3 @@ class AnalyticsManagerTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         prompt.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
