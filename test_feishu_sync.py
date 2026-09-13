@@ -246,6 +246,5 @@ class FeishuSyncTests(unittest.TestCase):
         self.assertIn("--yes", field_update)
         self.assertEqual(commands.count("+table-create"), 2)
 
-
 if __name__ == "__main__":
     unittest.main()
