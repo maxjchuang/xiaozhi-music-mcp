@@ -16,7 +16,7 @@ import secrets
 import ssl
 import time
 from typing import Any, Protocol
-from urllib.parse import quote, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from curl_cffi import requests as curl_requests
@@ -25,6 +25,17 @@ from curl_cffi import requests as curl_requests
 LOGGER = logging.getLogger("xiaozhi-music-providers")
 DEFAULT_TIMEOUT_SECONDS = 5.0
 NETEASE_ACCOUNT_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _netease_artwork_url(url: str, size: int = 720) -> str:
+    """Ask NetEase's image CDN for a bounded square instead of the multi-MP original."""
+    value = url.strip()
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    query = [(key, item) for key, item in parse_qsl(parts.query, keep_blank_values=True) if key != "param"]
+    query.append(("param", f"{size}y{size}"))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 class ProviderError(RuntimeError):
@@ -40,6 +51,7 @@ class Track:
     audio_url: str
     album: str = ""
     duration: int | None = None
+    song_duration: int | None = None
     content_type: str = "audio/mpeg"
     artwork_url: str = ""
     lyrics: str = ""
@@ -366,7 +378,8 @@ class NeteaseProvider:
                     artist=artist or "未知歌手",
                     album=str(album.get("name", "")) if isinstance(album, dict) else "",
                     duration=duration_ms // 1000 if duration_ms else None,
-                    artwork_url=str(album.get("picUrl", "")) if isinstance(album, dict) else "",
+                    artwork_url=_netease_artwork_url(str(album.get("picUrl", "")))
+                    if isinstance(album, dict) else "",
                     source_rank=rank,
                     query=query,
                     extra={"fee": _optional_int(song.get("fee"))},
@@ -412,6 +425,7 @@ class NeteaseProvider:
             artist=candidate.artist,
             album=candidate.album,
             duration=preview_duration if is_preview and preview_duration else candidate.duration,
+            song_duration=candidate.duration,
             content_type="audio/flac" if audio_type == "flac" else "audio/mpeg",
             artwork_url=candidate.artwork_url,
             lyrics=await self._lyrics(candidate.track_id),

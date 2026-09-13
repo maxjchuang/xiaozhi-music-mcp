@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import hashlib
 import json
@@ -23,6 +23,33 @@ LOGGER = logging.getLogger("xiaozhi-analytics")
 SCHEMA_VERSION = 1
 TRANSCRIPT_FIELDS = frozenset({"user_text", "assistant_text"})
 VALID_TRANSCRIPT_MODES = frozenset({"off", "masked", "full"})
+PLAYBACK_EVENT_TYPES = frozenset(
+    {
+        "playback_started",
+        "playback_paused",
+        "playback_resumed",
+        "playback_stopped",
+        "playback_completed",
+        "playback_failed",
+        "song_switched",
+        "audio_underrun",
+        "decode_error",
+        "network_error",
+    }
+)
+PLAYBACK_TERMINAL_TYPES = frozenset(
+    {"playback_stopped", "playback_completed", "playback_failed", "song_switched", "decode_error", "network_error"}
+)
+SESSION_EVENT_TYPES = frozenset(
+    {
+        "wake_detected",
+        "listening_started",
+        "listening_stopped",
+        "user_utterance",
+        "assistant_response",
+        *PLAYBACK_EVENT_TYPES,
+    }
+)
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(token|cookie|app_secret)\s*[:=]\s*([^\s,;&]+)"),
@@ -159,6 +186,16 @@ class OutboxItem:
     attempts: int
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectionOutboxItem:
+    entity_type: str
+    entity_id: str
+    revision: int
+    remote_record_id: str
+    fields: Mapping[str, Any]
+    attempts: int
+
+
 class AnalyticsStore:
     """SQLite event store with an idempotent transactional outbox."""
 
@@ -223,8 +260,113 @@ class AnalyticsStore:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS playbacks (
+                    playback_id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    artist TEXT NOT NULL DEFAULT '',
+                    album TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    original_query TEXT NOT NULL DEFAULT '',
+                    normalized_query TEXT NOT NULL DEFAULT '',
+                    playback_access TEXT NOT NULL DEFAULT 'full',
+                    media_duration_ms INTEGER,
+                    song_duration_ms INTEGER,
+                    requested_at TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT '',
+                    ended_at TEXT NOT NULL DEFAULT '',
+                    first_audio_wait_ms INTEGER NOT NULL DEFAULT 0,
+                    audible_played_ms INTEGER NOT NULL DEFAULT 0,
+                    elapsed_since_start_ms INTEGER NOT NULL DEFAULT 0,
+                    pause_total_ms INTEGER NOT NULL DEFAULT 0,
+                    pause_count INTEGER NOT NULL DEFAULT 0,
+                    underrun_count INTEGER NOT NULL DEFAULT 0,
+                    underrun_total_ms INTEGER NOT NULL DEFAULT 0,
+                    end_reason TEXT NOT NULL DEFAULT '',
+                    natural_completed INTEGER NOT NULL DEFAULT 0,
+                    quick_skip_level TEXT NOT NULL DEFAULT '',
+                    suspected_search_dissatisfaction INTEGER NOT NULL DEFAULT 0,
+                    dissatisfaction_reason TEXT NOT NULL DEFAULT '',
+                    next_action TEXT NOT NULL DEFAULT '',
+                    play_ratio REAL,
+                    status TEXT NOT NULL DEFAULT 'requested',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    last_monotonic_ms INTEGER NOT NULL DEFAULT -1,
+                    last_event_at TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_playbacks_trace_id ON playbacks(trace_id);
+                CREATE INDEX IF NOT EXISTS idx_playbacks_started_at ON playbacks(started_at);
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL DEFAULT '',
+                    firmware_version TEXT NOT NULL DEFAULT '',
+                    trace_id TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT '',
+                    ended_at TEXT NOT NULL DEFAULT '',
+                    wake_method TEXT NOT NULL DEFAULT '',
+                    user_text TEXT NOT NULL DEFAULT '',
+                    assistant_text TEXT NOT NULL DEFAULT '',
+                    turn_count INTEGER NOT NULL DEFAULT 0,
+                    triggered_music INTEGER NOT NULL DEFAULT 0,
+                    result TEXT NOT NULL DEFAULT '',
+                    error_type TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    last_monotonic_ms INTEGER NOT NULL DEFAULT -1,
+                    last_event_at TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
+
+                CREATE TABLE IF NOT EXISTS projection_outbox (
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at REAL NOT NULL DEFAULT 0,
+                    remote_record_id TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(entity_type, entity_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_projection_outbox_status
+                    ON projection_outbox(status, updated_at);
                 """
             )
+            self._ensure_columns(
+                connection,
+                "playbacks",
+                {
+                    "original_query": "TEXT NOT NULL DEFAULT ''",
+                    "normalized_query": "TEXT NOT NULL DEFAULT ''",
+                    "suspected_search_dissatisfaction": "INTEGER NOT NULL DEFAULT 0",
+                    "dissatisfaction_reason": "TEXT NOT NULL DEFAULT ''",
+                    "next_action": "TEXT NOT NULL DEFAULT ''",
+                    "first_audio_wait_ms": "INTEGER NOT NULL DEFAULT 0",
+                },
+            )
+            self._ensure_columns(
+                connection,
+                "projection_outbox",
+                {"next_attempt_at": "REAL NOT NULL DEFAULT 0"},
+            )
+
+    @staticmethod
+    def _ensure_columns(
+        connection: sqlite3.Connection, table: str, columns: Mapping[str, str]
+    ) -> None:
+        existing = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, declaration in columns.items():
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def append(self, event: AnalyticsEvent) -> bool:
         now = time.time()
@@ -257,7 +399,691 @@ class AnalyticsStore:
                 "INSERT INTO sync_outbox(event_id, updated_at) VALUES (?, ?)",
                 (event.event_id, now),
             )
+            self._apply_playback_projection(connection, event, now)
+            self._apply_session_projection(connection, event, now)
+            self._refresh_search_dissatisfaction(connection, event, now)
         return True
+
+    @staticmethod
+    def _optional_nonnegative_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+        return None
+
+    @staticmethod
+    def _quick_skip_level(end_reason: str, audible_ms: int, media_duration_ms: int | None) -> str:
+        if end_reason not in {"user_stopped", "song_switched"}:
+            return ""
+        try:
+            immediate_seconds = float(os.getenv("ANALYTICS_IMMEDIATE_SKIP_SECONDS", "10"))
+        except ValueError:
+            immediate_seconds = 10
+        try:
+            early_seconds = float(os.getenv("ANALYTICS_QUICK_SKIP_SECONDS", "30"))
+        except ValueError:
+            early_seconds = 30
+        immediate_ms = max(1, int(immediate_seconds * 1000))
+        early_ms = max(immediate_ms, int(early_seconds * 1000))
+        if audible_ms <= immediate_ms:
+            return "immediate"
+        if audible_ms <= early_ms:
+            return "early"
+        if media_duration_ms and audible_ms / media_duration_ms < 0.25:
+            return "low_ratio"
+        return ""
+
+    def _apply_playback_projection(
+        self, connection: sqlite3.Connection, event: AnalyticsEvent, now: float
+    ) -> None:
+        if event.event_type not in PLAYBACK_EVENT_TYPES:
+            return
+        payload = event.payload or {}
+        playback_id = str(payload.get("playback_id", "")).strip()[:128]
+        if not playback_id:
+            return
+        existing_row = connection.execute(
+            "SELECT * FROM playbacks WHERE playback_id = ?", (playback_id,)
+        ).fetchone()
+        existing = dict(existing_row) if existing_row is not None else {}
+
+        search_context: dict[str, Any] = {}
+        if event.trace_id:
+            search_row = connection.execute(
+                """
+                SELECT payload_json, occurred_at FROM events
+                WHERE trace_id = ? AND event_type IN ('music_search_succeeded', 'music_search_started')
+                ORDER BY CASE event_type WHEN 'music_search_succeeded' THEN 0 ELSE 1 END, created_at DESC
+                LIMIT 1
+                """,
+                (event.trace_id,),
+            ).fetchone()
+            if search_row is not None:
+                search_context = json.loads(search_row["payload_json"])
+                search_context["_occurred_at"] = search_row["occurred_at"]
+
+        incoming_clock = self._optional_nonnegative_int(payload.get("monotonic_ms"))
+        previous_clock = int(existing.get("last_monotonic_ms", -1))
+        lifecycle_is_current = incoming_clock is None or incoming_clock >= previous_clock
+        event_type = event.event_type
+
+        def text(name: str, fallback: str = "") -> str:
+            value = payload.get(name)
+            return str(value)[:500] if value not in {None, ""} else str(existing.get(name, fallback))
+
+        media_duration = self._optional_nonnegative_int(payload.get("media_duration_ms"))
+        if media_duration is None:
+            media_duration = existing.get("media_duration_ms")
+        song_duration = self._optional_nonnegative_int(payload.get("song_duration_ms"))
+        if song_duration is None:
+            song_duration = existing.get("song_duration_ms") or media_duration
+
+        audible_ms = max(
+            int(existing.get("audible_played_ms", 0)),
+            self._optional_nonnegative_int(payload.get("audible_played_ms")) or 0,
+        )
+        elapsed_ms = max(
+            int(existing.get("elapsed_since_start_ms", 0)),
+            self._optional_nonnegative_int(payload.get("elapsed_since_start_ms")) or 0,
+        )
+        pause_total_ms = max(
+            int(existing.get("pause_total_ms", 0)),
+            self._optional_nonnegative_int(payload.get("pause_total_ms")) or 0,
+        )
+        pause_count = int(existing.get("pause_count", 0))
+        underrun_count = int(existing.get("underrun_count", 0))
+        underrun_total_ms = int(existing.get("underrun_total_ms", 0))
+        if event_type == "playback_paused" and lifecycle_is_current:
+            pause_count += 1
+        if event_type == "audio_underrun":
+            underrun_count += 1
+            underrun_total_ms += self._optional_nonnegative_int(payload.get("wait_ms")) or 0
+        reported_underruns = self._optional_nonnegative_int(payload.get("underrun_count"))
+        reported_underrun_ms = self._optional_nonnegative_int(payload.get("underrun_total_ms"))
+        if reported_underruns is not None:
+            underrun_count = max(underrun_count, reported_underruns)
+        if reported_underrun_ms is not None:
+            underrun_total_ms = max(underrun_total_ms, reported_underrun_ms)
+
+        requested_at = str(existing.get("requested_at", ""))
+        started_at = str(existing.get("started_at", ""))
+        ended_at = str(existing.get("ended_at", ""))
+        first_audio_wait_ms = int(existing.get("first_audio_wait_ms", 0))
+        status = str(existing.get("status", "requested"))
+        end_reason = str(existing.get("end_reason", ""))
+        if event_type == "playback_started":
+            requested_at = requested_at or str(search_context.get("_occurred_at") or event.occurred_at)
+            started_at = started_at or event.occurred_at
+            try:
+                first_audio_wait_ms = max(
+                    0,
+                    round(
+                        (datetime.fromisoformat(started_at) - datetime.fromisoformat(requested_at)).total_seconds()
+                        * 1000
+                    ),
+                )
+            except ValueError:
+                first_audio_wait_ms = 0
+            if lifecycle_is_current:
+                status = "playing"
+                end_reason = ""
+                ended_at = ""
+        elif lifecycle_is_current:
+            if event_type == "playback_paused":
+                status = "paused"
+            elif event_type == "playback_resumed":
+                status = "playing"
+            elif event_type in PLAYBACK_TERMINAL_TYPES:
+                ended_at = event.occurred_at
+                if event_type == "playback_completed":
+                    end_reason = "natural_completed"
+                    status = "completed"
+                elif event_type == "playback_stopped":
+                    end_reason = str(payload.get("end_reason") or "user_stopped")[:100]
+                    status = "stopped"
+                elif event_type == "song_switched":
+                    end_reason = "song_switched"
+                    status = "stopped"
+                elif event_type == "decode_error":
+                    end_reason = "decode_failed"
+                    status = "failed"
+                elif event_type == "network_error":
+                    end_reason = "network_failed"
+                    status = "failed"
+                else:
+                    end_reason = str(payload.get("end_reason") or "unknown")[:100]
+                    status = "failed"
+
+        play_ratio = min(1.0, audible_ms / media_duration) if media_duration else None
+        quick_skip_level = self._quick_skip_level(end_reason, audible_ms, media_duration)
+        natural_completed = int(end_reason == "natural_completed")
+        revision = int(existing.get("revision", 0)) + 1
+        last_clock = max(previous_clock, incoming_clock if incoming_clock is not None else previous_clock)
+        values = (
+            playback_id,
+            event.trace_id or str(existing.get("trace_id", "")),
+            event.device_id or str(existing.get("device_id", "")),
+            event.session_id or str(existing.get("session_id", "")),
+            text("title"), text("artist"), text("album"), text("provider"),
+            str(search_context.get("query") or existing.get("original_query", ""))[:500],
+            str(search_context.get("normalized_query") or search_context.get("query") or existing.get("normalized_query", ""))[:500],
+            text("playback_access", "full"), media_duration, song_duration,
+            requested_at, started_at, ended_at, first_audio_wait_ms, audible_ms, elapsed_ms,
+            pause_total_ms, pause_count, underrun_count, underrun_total_ms,
+            end_reason, natural_completed, quick_skip_level,
+            int(existing.get("suspected_search_dissatisfaction", 0)),
+            str(existing.get("dissatisfaction_reason", "")),
+            str(existing.get("next_action", "")),
+            play_ratio, status,
+            revision, last_clock, event.occurred_at, now,
+        )
+        connection.execute(
+            """
+            INSERT INTO playbacks (
+                playback_id, trace_id, device_id, session_id, title, artist, album,
+                provider, original_query, normalized_query, playback_access,
+                media_duration_ms, song_duration_ms,
+                requested_at, started_at, ended_at, first_audio_wait_ms, audible_played_ms,
+                elapsed_since_start_ms, pause_total_ms, pause_count, underrun_count,
+                underrun_total_ms, end_reason, natural_completed, quick_skip_level,
+                suspected_search_dissatisfaction, dissatisfaction_reason, next_action,
+                play_ratio, status, revision, last_monotonic_ms, last_event_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(playback_id) DO UPDATE SET
+                trace_id=excluded.trace_id, device_id=excluded.device_id,
+                session_id=excluded.session_id, title=excluded.title, artist=excluded.artist,
+                album=excluded.album, provider=excluded.provider,
+                original_query=excluded.original_query,
+                normalized_query=excluded.normalized_query,
+                playback_access=excluded.playback_access,
+                media_duration_ms=excluded.media_duration_ms,
+                song_duration_ms=excluded.song_duration_ms,
+                requested_at=excluded.requested_at, started_at=excluded.started_at,
+                ended_at=excluded.ended_at, first_audio_wait_ms=excluded.first_audio_wait_ms,
+                audible_played_ms=excluded.audible_played_ms,
+                elapsed_since_start_ms=excluded.elapsed_since_start_ms,
+                pause_total_ms=excluded.pause_total_ms, pause_count=excluded.pause_count,
+                underrun_count=excluded.underrun_count,
+                underrun_total_ms=excluded.underrun_total_ms,
+                end_reason=excluded.end_reason, natural_completed=excluded.natural_completed,
+                quick_skip_level=excluded.quick_skip_level, play_ratio=excluded.play_ratio,
+                suspected_search_dissatisfaction=excluded.suspected_search_dissatisfaction,
+                dissatisfaction_reason=excluded.dissatisfaction_reason,
+                next_action=excluded.next_action,
+                status=excluded.status, revision=excluded.revision,
+                last_monotonic_ms=excluded.last_monotonic_ms,
+                last_event_at=excluded.last_event_at, updated_at=excluded.updated_at
+            """,
+            values,
+        )
+        connection.execute(
+            """
+            INSERT INTO projection_outbox (
+                entity_type, entity_id, revision, status, attempts, next_attempt_at, updated_at
+            ) VALUES ('playback', ?, ?, 'pending', 0, 0, ?)
+            ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                revision=excluded.revision, status='pending', attempts=0,
+                next_attempt_at=0, last_error='', updated_at=excluded.updated_at
+            """,
+            (playback_id, revision, now),
+        )
+
+    def _apply_session_projection(
+        self, connection: sqlite3.Connection, event: AnalyticsEvent, now: float
+    ) -> None:
+        if event.event_type not in SESSION_EVENT_TYPES or not event.session_id:
+            return
+        payload = event.payload or {}
+        existing_row = connection.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (event.session_id,)
+        ).fetchone()
+        existing = dict(existing_row) if existing_row is not None else {}
+        incoming_clock = self._optional_nonnegative_int(payload.get("monotonic_ms"))
+        previous_clock = int(existing.get("last_monotonic_ms", -1))
+        is_current = incoming_clock is None or incoming_clock >= previous_clock
+        started_at = str(existing.get("started_at", "")) or event.occurred_at
+        ended_at = str(existing.get("ended_at", ""))
+        if event.event_type == "listening_stopped" and is_current:
+            ended_at = event.occurred_at
+        turn_count = int(existing.get("turn_count", 0))
+        if event.event_type == "user_utterance" and is_current:
+            turn_count += 1
+        user_text = str(existing.get("user_text", ""))
+        assistant_text = str(existing.get("assistant_text", ""))
+        if event.event_type == "user_utterance" and is_current:
+            user_text = self._append_session_text(
+                user_text, str(payload.get("user_text", ""))
+            )
+        elif event.event_type == "assistant_response" and is_current:
+            assistant_text = self._append_session_text(
+                assistant_text, str(payload.get("assistant_text", ""))
+            )
+        result = str(existing.get("result", ""))
+        error_type = str(existing.get("error_type", ""))
+        if event.event_type in {"network_error", "decode_error", "playback_failed"}:
+            result = "failed"
+            error_type = str(payload.get("error_type") or payload.get("end_reason") or event.event_type)[:200]
+        elif event.event_type == "playback_completed":
+            result = "completed"
+        elif event.event_type == "playback_stopped":
+            result = "stopped"
+        elif event.event_type == "song_switched":
+            result = "switched"
+        revision = int(existing.get("revision", 0)) + 1
+        values = (
+            event.session_id,
+            event.device_id or str(existing.get("device_id", "")),
+            str(payload.get("firmware_version") or existing.get("firmware_version", ""))[:200],
+            event.trace_id or str(existing.get("trace_id", "")),
+            started_at,
+            ended_at,
+            str(payload.get("wake_method") or existing.get("wake_method", ""))[:100],
+            user_text,
+            assistant_text,
+            turn_count,
+            int(bool(existing.get("triggered_music", 0)) or event.event_type == "playback_started"),
+            result,
+            error_type,
+            revision,
+            max(previous_clock, incoming_clock if incoming_clock is not None else previous_clock),
+            event.occurred_at,
+            now,
+        )
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_id, device_id, firmware_version, trace_id, started_at, ended_at,
+                wake_method, user_text, assistant_text, turn_count, triggered_music,
+                result, error_type, revision, last_monotonic_ms, last_event_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                device_id=excluded.device_id, firmware_version=excluded.firmware_version,
+                trace_id=excluded.trace_id, started_at=excluded.started_at,
+                ended_at=excluded.ended_at, wake_method=excluded.wake_method,
+                user_text=excluded.user_text, assistant_text=excluded.assistant_text,
+                turn_count=excluded.turn_count, triggered_music=excluded.triggered_music,
+                result=excluded.result, error_type=excluded.error_type,
+                revision=excluded.revision, last_monotonic_ms=excluded.last_monotonic_ms,
+                last_event_at=excluded.last_event_at, updated_at=excluded.updated_at
+            """,
+            values,
+        )
+        connection.execute(
+            """
+            INSERT INTO projection_outbox (
+                entity_type, entity_id, revision, status, attempts, next_attempt_at, updated_at
+            ) VALUES ('session', ?, ?, 'pending', 0, 0, ?)
+            ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                revision=excluded.revision, status='pending', attempts=0,
+                next_attempt_at=0, last_error='', updated_at=excluded.updated_at
+            """,
+            (event.session_id, revision, now),
+        )
+
+    @staticmethod
+    def _append_session_text(existing: str, incoming: str) -> str:
+        value = incoming.strip()
+        if not value:
+            return existing[:4000]
+        parts = existing.split("\n") if existing else []
+        if parts and parts[-1] == value:
+            return existing[:4000]
+        return "\n".join([*parts, value])[-4000:]
+
+    def _refresh_search_dissatisfaction(
+        self, connection: sqlite3.Connection, event: AnalyticsEvent, now: float
+    ) -> None:
+        if event.event_type != "music_search_started":
+            return
+        current_query = str((event.payload or {}).get("query", "")).strip()
+        rows = connection.execute(
+            """
+            SELECT playback_id, original_query, ended_at FROM playbacks
+            WHERE quick_skip_level != '' AND ended_at != ''
+              AND suspected_search_dissatisfaction = 0
+            ORDER BY ended_at DESC LIMIT 10
+            """
+        ).fetchall()
+        current_time = datetime.fromisoformat(event.occurred_at)
+        for row in rows:
+            ended_time = datetime.fromisoformat(row["ended_at"])
+            delta = (current_time - ended_time).total_seconds()
+            if delta < 0 or delta > 60:
+                continue
+            reason = "same_query_retried" if current_query and current_query == row["original_query"] else "new_query_after_skip"
+            connection.execute(
+                """
+                UPDATE playbacks SET suspected_search_dissatisfaction=1,
+                    dissatisfaction_reason=?, next_action='searched_again',
+                    revision=revision+1, updated_at=? WHERE playback_id=?
+                """,
+                (reason, now, row["playback_id"]),
+            )
+            revision = connection.execute(
+                "SELECT revision FROM playbacks WHERE playback_id=?", (row["playback_id"],)
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO projection_outbox (
+                    entity_type, entity_id, revision, status, attempts, next_attempt_at, updated_at
+                ) VALUES ('playback', ?, ?, 'pending', 0, 0, ?)
+                ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                    revision=excluded.revision, status='pending', attempts=0,
+                    next_attempt_at=0, last_error='', updated_at=excluded.updated_at
+                """,
+                (row["playback_id"], revision, now),
+            )
+            break
+
+    def playback_status(self) -> dict[str, int]:
+        result = {"playbacks": 0, "sessions": 0, "pending": 0, "sending": 0, "synced": 0, "dead": 0}
+        with self._connection() as connection:
+            result["playbacks"] = int(connection.execute("SELECT COUNT(*) FROM playbacks").fetchone()[0])
+            result["sessions"] = int(connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+            for row in connection.execute(
+                "SELECT status, COUNT(*) AS count FROM projection_outbox GROUP BY status"
+            ):
+                result[str(row["status"])] = int(row["count"])
+        return result
+
+    def get_playback(self, playback_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM playbacks WHERE playback_id = ?", (playback_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def query_sessions(
+        self,
+        *,
+        device_id: str = "",
+        since: str = "",
+        until: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if device_id:
+            clauses.append("device_id = ?")
+            parameters.append(device_id)
+        if since:
+            clauses.append("started_at >= ?")
+            parameters.append(since)
+        if until:
+            clauses.append("started_at <= ?")
+            parameters.append(until)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(max(1, min(limit, 1000)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM sessions {where} ORDER BY started_at DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_session(self, session_id: str) -> dict[str, int]:
+        """Delete one session and its local raw/playback projections."""
+        with self._connection() as connection:
+            playback_ids = [
+                str(row["playback_id"])
+                for row in connection.execute(
+                    "SELECT playback_id FROM playbacks WHERE session_id = ?", (session_id,)
+                )
+            ]
+            if playback_ids:
+                placeholders = ",".join("?" for _ in playback_ids)
+                connection.execute(
+                    f"DELETE FROM projection_outbox WHERE entity_type='playback' "
+                    f"AND entity_id IN ({placeholders})",
+                    playback_ids,
+                )
+            connection.execute(
+                "DELETE FROM projection_outbox WHERE entity_type='session' AND entity_id=?",
+                (session_id,),
+            )
+            deleted_playbacks = connection.execute(
+                "DELETE FROM playbacks WHERE session_id = ?", (session_id,)
+            ).rowcount
+            deleted_sessions = connection.execute(
+                "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+            ).rowcount
+            deleted_events = connection.execute(
+                "DELETE FROM events WHERE session_id = ?", (session_id,)
+            ).rowcount
+        return {
+            "events": int(deleted_events),
+            "playbacks": int(deleted_playbacks),
+            "sessions": int(deleted_sessions),
+        }
+
+    def cleanup_retention(
+        self, *, raw_days: int = 30, projection_days: int = 180
+    ) -> dict[str, int]:
+        """Remove only synced rows older than the configured retention windows."""
+        raw_cutoff = isoformat_utc(utc_now() - timedelta(days=max(1, raw_days)))
+        projection_cutoff = isoformat_utc(
+            utc_now() - timedelta(days=max(1, projection_days))
+        )
+        with self._connection() as connection:
+            old_playbacks = [
+                str(row["playback_id"])
+                for row in connection.execute(
+                    """
+                    SELECT p.playback_id FROM playbacks AS p
+                    JOIN projection_outbox AS o
+                      ON o.entity_type='playback' AND o.entity_id=p.playback_id
+                    WHERE o.status='synced' AND p.last_event_at != ''
+                      AND p.last_event_at < ?
+                    """,
+                    (projection_cutoff,),
+                )
+            ]
+            old_sessions = [
+                str(row["session_id"])
+                for row in connection.execute(
+                    """
+                    SELECT s.session_id FROM sessions AS s
+                    JOIN projection_outbox AS o
+                      ON o.entity_type='session' AND o.entity_id=s.session_id
+                    WHERE o.status='synced' AND s.last_event_at != ''
+                      AND s.last_event_at < ?
+                    """,
+                    (projection_cutoff,),
+                )
+            ]
+            for entity_type, identifiers in (
+                ("playback", old_playbacks),
+                ("session", old_sessions),
+            ):
+                if not identifiers:
+                    continue
+                placeholders = ",".join("?" for _ in identifiers)
+                connection.execute(
+                    f"DELETE FROM projection_outbox WHERE entity_type=? "
+                    f"AND entity_id IN ({placeholders})",
+                    (entity_type, *identifiers),
+                )
+            if old_playbacks:
+                placeholders = ",".join("?" for _ in old_playbacks)
+                connection.execute(
+                    f"DELETE FROM playbacks WHERE playback_id IN ({placeholders})",
+                    old_playbacks,
+                )
+            if old_sessions:
+                placeholders = ",".join("?" for _ in old_sessions)
+                connection.execute(
+                    f"DELETE FROM sessions WHERE session_id IN ({placeholders})",
+                    old_sessions,
+                )
+            deleted_events = connection.execute(
+                """
+                DELETE FROM events WHERE occurred_at < ? AND event_id IN (
+                    SELECT event_id FROM sync_outbox WHERE status='synced'
+                )
+                """,
+                (raw_cutoff,),
+            ).rowcount
+        return {
+            "events": int(deleted_events),
+            "playbacks": len(old_playbacks),
+            "sessions": len(old_sessions),
+        }
+
+    def claim_projection_batch(
+        self, limit: int = 20, *, stale_after_seconds: float = 300
+    ) -> list[ProjectionOutboxItem]:
+        bounded_limit = max(1, min(limit, 100))
+        now = time.time()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE projection_outbox SET status='pending', updated_at=?
+                WHERE status='sending' AND updated_at <= ?
+                """,
+                (now, now - stale_after_seconds),
+            )
+            outbox_rows = connection.execute(
+                """
+                SELECT * FROM projection_outbox
+                WHERE status='pending' AND next_attempt_at <= ?
+                ORDER BY updated_at, entity_type, entity_id LIMIT ?
+                """,
+                (now, bounded_limit),
+            ).fetchall()
+            items: list[ProjectionOutboxItem] = []
+            for outbox in outbox_rows:
+                table = "playbacks" if outbox["entity_type"] == "playback" else "sessions"
+                key = "playback_id" if table == "playbacks" else "session_id"
+                row = connection.execute(
+                    f"SELECT * FROM {table} WHERE {key} = ?", (outbox["entity_id"],)
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        "DELETE FROM projection_outbox WHERE entity_type=? AND entity_id=?",
+                        (outbox["entity_type"], outbox["entity_id"]),
+                    )
+                    continue
+                items.append(
+                    ProjectionOutboxItem(
+                        entity_type=str(outbox["entity_type"]),
+                        entity_id=str(outbox["entity_id"]),
+                        revision=int(outbox["revision"]),
+                        remote_record_id=str(outbox["remote_record_id"]),
+                        fields=dict(row),
+                        attempts=int(outbox["attempts"]),
+                    )
+                )
+            if items:
+                connection.executemany(
+                    """
+                    UPDATE projection_outbox SET status='sending', updated_at=?
+                    WHERE entity_type=? AND entity_id=?
+                    """,
+                    [(now, item.entity_type, item.entity_id) for item in items],
+                )
+        return items
+
+    def mark_projection_synced(
+        self, entity_type: str, entity_id: str, revision: int, remote_record_id: str
+    ) -> None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT revision FROM projection_outbox WHERE entity_type=? AND entity_id=?",
+                (entity_type, entity_id),
+            ).fetchone()
+            if row is None:
+                return
+            if int(row["revision"]) == revision:
+                connection.execute(
+                    """
+                    UPDATE projection_outbox SET status='synced', remote_record_id=?,
+                        last_error='', updated_at=? WHERE entity_type=? AND entity_id=?
+                    """,
+                    (remote_record_id[:128], time.time(), entity_type, entity_id),
+                )
+            elif remote_record_id:
+                connection.execute(
+                    """
+                    UPDATE projection_outbox SET remote_record_id=?, status='pending',
+                        next_attempt_at=0, updated_at=? WHERE entity_type=? AND entity_id=?
+                    """,
+                    (remote_record_id[:128], time.time(), entity_type, entity_id),
+                )
+
+    def release_projection_batch(
+        self, items: list[ProjectionOutboxItem], error: str, *, delay_seconds: float = 30
+    ) -> None:
+        now = time.time()
+        with self._connection() as connection:
+            connection.executemany(
+                """
+                UPDATE projection_outbox SET status='pending', next_attempt_at=?,
+                    last_error=?, updated_at=? WHERE entity_type=? AND entity_id=?
+                """,
+                [
+                    (
+                        now + max(0, delay_seconds),
+                        mask_text(error)[:1000],
+                        now,
+                        item.entity_type,
+                        item.entity_id,
+                    )
+                    for item in items
+                ],
+            )
+
+    def mark_projection_failed(
+        self, item: ProjectionOutboxItem, error: str, *, max_attempts: int = 8
+    ) -> str:
+        attempts = item.attempts + 1
+        status = "dead" if attempts >= max_attempts else "pending"
+        delay = 0 if status == "dead" else min(3600, 2 ** min(attempts, 10))
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE projection_outbox SET status=?, attempts=?, next_attempt_at=?,
+                    last_error=?, updated_at=? WHERE entity_type=? AND entity_id=?
+                """,
+                (
+                    status,
+                    attempts,
+                    time.time() + delay,
+                    mask_text(error)[:1000],
+                    time.time(),
+                    item.entity_type,
+                    item.entity_id,
+                ),
+            )
+        return status
+
+    def rebuild_playback_projections(self) -> int:
+        with self._connection() as connection:
+            connection.execute("DELETE FROM projection_outbox")
+            connection.execute("DELETE FROM playbacks")
+            connection.execute("DELETE FROM sessions")
+            rows = connection.execute(
+                "SELECT * FROM events ORDER BY created_at, event_id"
+            ).fetchall()
+            rebuilt = set()
+            now = time.time()
+            for row in rows:
+                event = self._event_from_row(row)
+                playback_id = str((event.payload or {}).get("playback_id", ""))
+                if event.event_type in PLAYBACK_EVENT_TYPES and playback_id:
+                    self._apply_playback_projection(connection, event, now)
+                    rebuilt.add(playback_id)
+                self._apply_session_projection(connection, event, now)
+                self._refresh_search_dissatisfaction(connection, event, now)
+        return len(rebuilt)
 
     def claim_batch(self, limit: int = 100, *, stale_after_seconds: float = 300) -> list[OutboxItem]:
         bounded_limit = max(1, min(limit, 500))
@@ -367,7 +1193,15 @@ class AnalyticsStore:
                 """,
                 (time.time(),),
             )
-        return cursor.rowcount
+            projection_cursor = connection.execute(
+                """
+                UPDATE projection_outbox
+                SET status='pending', attempts=0, next_attempt_at=0,
+                    last_error='', updated_at=? WHERE status='dead'
+                """,
+                (time.time(),),
+            )
+        return cursor.rowcount + projection_cursor.rowcount
 
     def status(self) -> dict[str, int]:
         result = {"pending": 0, "sending": 0, "synced": 0, "dead": 0, "events": 0}
@@ -420,8 +1254,9 @@ class AnalyticsRecorder:
         session_id: str = "",
         trace_id: str = "",
         event_id: str | None = None,
+        occurred_at: datetime | None = None,
     ) -> str:
-        event = AnalyticsEvent.create(
+        event = self.create_event(
             event_type,
             source=source,
             payload=payload,
@@ -429,14 +1264,38 @@ class AnalyticsRecorder:
             session_id=session_id,
             trace_id=trace_id,
             event_id=event_id,
-            privacy_mode=self.privacy_mode,
-            device_salt=self.device_salt,
+            occurred_at=occurred_at,
         )
         try:
             self.store.append(event)
         except Exception as exc:  # analytics must never break music playback
             LOGGER.warning("无法写入使用行为事件 %s：%s", event_type, mask_text(str(exc)))
         return event.event_id
+
+    def create_event(
+        self,
+        event_type: str,
+        *,
+        source: str,
+        payload: Mapping[str, Any] | None = None,
+        device_id: str = "",
+        session_id: str = "",
+        trace_id: str = "",
+        event_id: str | None = None,
+        occurred_at: datetime | None = None,
+    ) -> AnalyticsEvent:
+        return AnalyticsEvent.create(
+            event_type,
+            source=source,
+            payload=payload,
+            device_id=device_id,
+            session_id=session_id,
+            trace_id=trace_id,
+            event_id=event_id,
+            occurred_at=occurred_at,
+            privacy_mode=self.privacy_mode,
+            device_salt=self.device_salt,
+        )
 
 
 _RECORDER: AnalyticsRecorder | None = None

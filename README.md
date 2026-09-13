@@ -220,7 +220,15 @@ bash scripts/music_service.sh analytics init
 bash scripts/music_service.sh analytics test
 ```
 
-`auth login` 会调用 `lark-cli auth login --domain base`，按 CLI 提示完成 Device Flow 授权。Token 的存储和刷新由 CLI 管理，项目不会读取 Token。`analytics init` 会创建或校验“原始事件”表和“小智使用分析”仪表盘，并将表 ID、仪表盘 ID 写入权限为 `0600` 的 `.env`。
+`auth login` 会调用 `lark-cli auth login --domain base`，按 CLI 提示完成 Device Flow 授权。Token 的存储和刷新由 CLI 管理，项目不会读取 Token。
+
+如果没有配置 `FEISHU_BASE_TOKEN`，交互式执行 `analytics init` 会询问是否自动创建并初始化“小智使用分析”多维表格；确认后会复用并重命名飞书自动生成的首张数据表，不留下无用表。非交互部署可显式执行：
+
+```bash
+bash scripts/music_service.sh analytics init --create-base
+```
+
+也可以通过 `--base-name "家庭小智分析"` 自定义名称。初始化完成后，Base Token、表 ID 和仪表盘 ID 会写入权限为 `0600` 的 `.env`。
 
 ### 3. 日常管理
 
@@ -229,11 +237,20 @@ bash scripts/music_service.sh auth status
 bash scripts/music_service.sh analytics status
 bash scripts/music_service.sh analytics sync
 bash scripts/music_service.sh analytics retry
+bash scripts/music_service.sh analytics telemetry-status
+bash scripts/music_service.sh analytics inspect-playback <playback_id>
+bash scripts/music_service.sh analytics inspect-session <session_id>
+bash scripts/music_service.sh analytics query-sessions --since 2026-09-01T00:00:00+00:00
+bash scripts/music_service.sh analytics delete-session <session_id> --yes
+bash scripts/music_service.sh analytics cleanup --yes
+bash scripts/music_service.sh analytics rebuild
 ```
+
+本地原始事件默认保留 30 天，会话和播放投影默认保留 180 天，可通过 `ANALYTICS_RAW_RETENTION_DAYS` 和 `ANALYTICS_PROJECTION_RETENTION_DAYS` 调整。自动清理只处理已成功同步的数据；待同步和死信事件会继续保留。`delete-session` 是显式的本地隐私删除操作，不会自动删除已经同步到飞书的记录。
 
 交互式执行 `start` 时，如果尚未登录，会自动进入登录流程。LaunchAgent 等后台启动不会等待浏览器；它会记录 `AUTH_REQUIRED`，保留本地事件并继续提供音乐服务。只有显式设置 `FEISHU_AUTH_REQUIRED_ON_START=true` 时，授权失败才会阻止启动。
 
-当前版本能完整统计 MCP 可观察到的音乐搜索和开始播放行为。普通对话、唤醒、自然播放结束、换歌和音频欠载需要 EchoEar 固件增加遥测上报后才能准确记录。
+当前 MCP 与 EchoEar 固件代码已完成媒体级遥测对接，协议见 [EchoEar 播放遥测协议](docs/PLAYBACK_TELEMETRY_PROTOCOL.md)。新固件会在播放结束后用低优先级异步任务批量上报真实开始出声、自然结束、主动停止、切歌、欠载以及本次音乐会话中的唤醒/ASR/助手回复，不在音频播放线程中发 HTTP 请求。只有烧录包含该实现的新固件后，飞书才会出现会话和播放业务数据。
 
 ## 迁移到另一台电脑
 

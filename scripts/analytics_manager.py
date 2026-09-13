@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
@@ -96,6 +97,80 @@ def analytics_status() -> int:
     return 0
 
 
+def telemetry_status() -> int:
+    status = AnalyticsStore(default_database_path()).playback_status()
+    print(f"播放记录：{status['playbacks']}")
+    print(f"会话记录：{status['sessions']}")
+    print(
+        f"投影待同步：{status['pending']}，已同步：{status['synced']}，死信：{status['dead']}"
+    )
+    return 0
+
+
+def analytics_rebuild() -> int:
+    count = AnalyticsStore(default_database_path()).rebuild_playback_projections()
+    print(f"已从原始事件重建 {count} 条播放记录。")
+    return 0
+
+
+def inspect_playback(playback_id: str) -> int:
+    playback = AnalyticsStore(default_database_path()).get_playback(playback_id)
+    if playback is None:
+        print(f"未找到播放记录：{playback_id}", file=sys.stderr)
+        return 4
+    print(json.dumps(playback, ensure_ascii=False, indent=2))
+    return 0
+
+
+def inspect_session(session_id: str) -> int:
+    session = AnalyticsStore(default_database_path()).get_session(session_id)
+    if session is None:
+        print(f"未找到会话记录：{session_id}", file=sys.stderr)
+        return 4
+    print(json.dumps(session, ensure_ascii=False, indent=2))
+    return 0
+
+
+def query_sessions(device_id: str, since: str, until: str, limit: int) -> int:
+    rows = AnalyticsStore(default_database_path()).query_sessions(
+        device_id=device_id, since=since, until=until, limit=limit
+    )
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
+    return 0
+
+
+def delete_session(session_id: str, confirmed: bool) -> int:
+    if not confirmed:
+        print("删除会话会清除本地原始事件和播放投影；确认后请追加 --yes。", file=sys.stderr)
+        return 2
+    deleted = AnalyticsStore(default_database_path()).delete_session(session_id)
+    print(
+        f"已删除会话 {session_id}：{deleted['events']} 条原始事件，"
+        f"{deleted['playbacks']} 条播放记录，{deleted['sessions']} 条会话记录。"
+    )
+    return 0
+
+
+def analytics_cleanup(confirmed: bool) -> int:
+    if not confirmed:
+        print("保留期清理只删除已同步数据；确认后请追加 --yes。", file=sys.stderr)
+        return 2
+    try:
+        raw_days = int(os.getenv("ANALYTICS_RAW_RETENTION_DAYS", "30"))
+        projection_days = int(os.getenv("ANALYTICS_PROJECTION_RETENTION_DAYS", "180"))
+    except ValueError:
+        print("保留期必须是整数天。", file=sys.stderr)
+        return 2
+    deleted = AnalyticsStore(default_database_path()).cleanup_retention(
+        raw_days=raw_days, projection_days=projection_days
+    )
+    print(
+        f"保留期清理完成：{deleted['events']} 条原始事件，"
+        f"{deleted['playbacks']} 条播放记录，{deleted['sessions']} 条会话记录。"
+    )
+    return 0
+
+
 def analytics_retry() -> int:
     count = AnalyticsStore(default_database_path()).retry_dead()
     print(f"已重新投递 {count} 条死信事件。")
@@ -159,10 +234,34 @@ def set_project_env(values: dict[str, str]) -> None:
     path.chmod(0o600)
 
 
-def analytics_init() -> int:
+def analytics_init(*, create_base: bool = False, base_name: str = "小智使用分析") -> int:
+    base_token = os.getenv("FEISHU_BASE_TOKEN", "").strip()
+    created_base_url = ""
     try:
-        client = FeishuBaseClient.from_env()
-        table_id, dashboard_id = client.initialize()
+        if base_token:
+            client = FeishuBaseClient.from_env()
+            table_id, session_table_id, play_table_id, dashboard_id = client.initialize()
+        else:
+            should_create = create_base
+            if not should_create:
+                if not sys.stdin.isatty():
+                    print(
+                        "初始化失败：缺少 FEISHU_BASE_TOKEN。非交互模式下可添加 "
+                        "--create-base 自动创建多维表格。",
+                        file=sys.stderr,
+                    )
+                    return 3
+                answer = input(
+                    f"尚未配置 FEISHU_BASE_TOKEN，是否自动创建并初始化多维表格“{base_name}”？[Y/n] "
+                ).strip().lower()
+                should_create = answer in {"", "y", "yes", "是"}
+            if not should_create:
+                print("已取消创建。请配置 FEISHU_BASE_TOKEN 后重新执行 analytics init。")
+                return 2
+            client, default_table_id, created_base_url = FeishuBaseClient.create_base(base_name)
+            table_id, session_table_id, play_table_id, dashboard_id = client.initialize(
+                fresh_base=True, default_table_id=default_table_id
+            )
     except (LarkCliError, FeishuApiError, OSError, ValueError) as exc:
         print(f"初始化失败：{exc}", file=sys.stderr)
         return 3
@@ -172,11 +271,17 @@ def analytics_init() -> int:
             "LARK_CLI_BIN": str(LarkCliAuth().cli.executable),
             "FEISHU_BASE_TOKEN": client.base_token,
             "FEISHU_EVENT_TABLE_ID": table_id,
+            "FEISHU_SESSION_TABLE_ID": session_table_id,
+            "FEISHU_PLAY_TABLE_ID": play_table_id,
             "FEISHU_DASHBOARD_ID": dashboard_id,
         }
     )
     print(f"原始事件表：{table_id}")
+    print(f"会话记录表：{session_table_id}")
+    print(f"音乐播放记录表：{play_table_id}")
     print(f"统计仪表盘：{dashboard_id}")
+    if created_base_url:
+        print(f"多维表格：{created_base_url}")
     print("初始化成功，配置已写入 .env。")
     return 0
 
@@ -194,10 +299,28 @@ def build_parser() -> argparse.ArgumentParser:
     analytics = group.add_parser("analytics")
     analytics_commands = analytics.add_subparsers(dest="command", required=True)
     analytics_commands.add_parser("status")
-    analytics_commands.add_parser("init")
+    initialize = analytics_commands.add_parser("init")
+    initialize.add_argument("--create-base", action="store_true")
+    initialize.add_argument("--base-name", default="小智使用分析")
     analytics_commands.add_parser("retry")
     analytics_commands.add_parser("sync")
     analytics_commands.add_parser("test")
+    analytics_commands.add_parser("telemetry-status")
+    analytics_commands.add_parser("rebuild")
+    inspect = analytics_commands.add_parser("inspect-playback")
+    inspect.add_argument("playback_id")
+    inspect_session_parser = analytics_commands.add_parser("inspect-session")
+    inspect_session_parser.add_argument("session_id")
+    query_session_parser = analytics_commands.add_parser("query-sessions")
+    query_session_parser.add_argument("--device-id", default="")
+    query_session_parser.add_argument("--since", default="")
+    query_session_parser.add_argument("--until", default="")
+    query_session_parser.add_argument("--limit", type=int, default=100)
+    delete_session_parser = analytics_commands.add_parser("delete-session")
+    delete_session_parser.add_argument("session_id")
+    delete_session_parser.add_argument("--yes", action="store_true")
+    cleanup_parser = analytics_commands.add_parser("cleanup")
+    cleanup_parser.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -215,7 +338,10 @@ def main() -> int:
             return auth_preflight(arguments.interactive)
     if arguments.group == "analytics":
         if arguments.command == "init":
-            return analytics_init()
+            return analytics_init(
+                create_base=arguments.create_base,
+                base_name=arguments.base_name,
+            )
         if arguments.command == "status":
             return analytics_status()
         if arguments.command == "retry":
@@ -224,6 +350,22 @@ def main() -> int:
             return analytics_sync()
         if arguments.command == "test":
             return analytics_test()
+        if arguments.command == "telemetry-status":
+            return telemetry_status()
+        if arguments.command == "rebuild":
+            return analytics_rebuild()
+        if arguments.command == "inspect-playback":
+            return inspect_playback(arguments.playback_id)
+        if arguments.command == "inspect-session":
+            return inspect_session(arguments.session_id)
+        if arguments.command == "query-sessions":
+            return query_sessions(
+                arguments.device_id, arguments.since, arguments.until, arguments.limit
+            )
+        if arguments.command == "delete-session":
+            return delete_session(arguments.session_id, arguments.yes)
+        if arguments.command == "cleanup":
+            return analytics_cleanup(arguments.yes)
     return 2
 
 

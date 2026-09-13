@@ -169,9 +169,10 @@ if [[ "${analytics_enabled}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ ]] || \
 
     feishu_base_token="$(env_value FEISHU_BASE_TOKEN || true)"
     if [[ -z "${feishu_base_token}" ]]; then
-        read -r -p "飞书多维表格 Base Token：" feishu_base_token
-        [[ -n "${feishu_base_token}" ]] || fail "启用飞书统计时 FEISHU_BASE_TOKEN 不能为空。"
-        set_env_value FEISHU_BASE_TOKEN "${feishu_base_token}"
+        read -r -p "已有飞书 Base Token（直接回车可在下一步自动创建）：" feishu_base_token
+        if [[ -n "${feishu_base_token}" ]]; then
+            set_env_value FEISHU_BASE_TOKEN "${feishu_base_token}"
+        fi
     fi
 
     printf '即将启动飞书 CLI Device Flow，不需要配置 OAuth 回调地址。\n'
@@ -187,7 +188,7 @@ if [[ "${skip_tests}" == "false" ]]; then
     info "运行本地测试"
     "${VENV_PYTHON}" -m unittest -v \
         test_music_providers.py test_audio_proxy.py test_music_mcp_server.py \
-        test_provider_manager.py test_netease_account.py test_music_search.py test_usage_analytics.py \
+        test_provider_manager.py test_netease_account.py test_music_search.py test_usage_analytics.py test_analytics_manager.py \
         test_lark_cli.py test_feishu_sync.py
     "${VENV_PYTHON}" test_mcp.py
     "${VENV_PYTHON}" test_mcp_pipe.py

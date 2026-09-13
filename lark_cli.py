@@ -84,12 +84,16 @@ class LarkCli:
 REQUIRED_BASE_SCOPES = frozenset(
     {
         "offline_access",
+        "base:app:create",
         "base:record:create",
         "base:record:read",
+        "base:record:update",
         "base:table:create",
         "base:table:read",
+        "base:table:update",
         "base:field:create",
         "base:field:read",
+        "base:field:update",
         "base:dashboard:create",
         "base:dashboard:read",
     }

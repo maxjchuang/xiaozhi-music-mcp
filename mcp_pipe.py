@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
@@ -27,7 +28,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
 import websockets
 
-from usage_analytics import get_recorder
+from usage_analytics import get_recorder, mask_text
 from feishu_sync import start_sync_worker
 
 
@@ -40,8 +41,35 @@ MEDIA_PREFIX = "/media/"
 MAX_REGISTER_BODY = 96 * 1024
 MAX_REGISTERED_STREAMS = 256
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-MAX_IMAGE_PIXELS = 4096 * 4096
+# Covers common 4167x4167 album masters while still bounding decompression RAM.
+MAX_IMAGE_PIXELS = 24 * 1024 * 1024
 MAX_LYRICS_BYTES = 64 * 1024
+MAX_TELEMETRY_BODY = 64 * 1024
+MAX_TELEMETRY_EVENTS = 64
+PLAYBACK_TELEMETRY_TYPES = frozenset(
+    {
+        "playback_started",
+        "playback_paused",
+        "playback_resumed",
+        "playback_stopped",
+        "playback_completed",
+        "playback_failed",
+        "song_switched",
+        "audio_underrun",
+        "decode_error",
+        "network_error",
+    }
+)
+SESSION_TELEMETRY_TYPES = frozenset(
+    {
+        "wake_detected",
+        "listening_started",
+        "listening_stopped",
+        "user_utterance",
+        "assistant_response",
+    }
+)
+TELEMETRY_TYPES = PLAYBACK_TELEMETRY_TYPES | SESSION_TELEMETRY_TYPES
 
 
 @dataclass(slots=True)
@@ -53,6 +81,8 @@ class StreamSource:
     artist: str = ""
     album: str = ""
     duration_ms: int | None = None
+    song_duration_ms: int | None = None
+    playback_access: str = "full"
     artwork_url: str = ""
     lyrics: str = ""
     lyrics_url: str = ""
@@ -85,6 +115,8 @@ class AudioProxyServer(ThreadingHTTPServer):
         artist: str = "",
         album: str = "",
         duration_ms: int | None = None,
+        song_duration_ms: int | None = None,
+        playback_access: str = "full",
         artwork_url: str = "",
         lyrics: str = "",
         lyrics_url: str = "",
@@ -108,6 +140,8 @@ class AudioProxyServer(ThreadingHTTPServer):
                 artist=artist,
                 album=album,
                 duration_ms=duration_ms,
+                song_duration_ms=song_duration_ms,
+                playback_access=playback_access,
                 artwork_url=artwork_url,
                 lyrics=lyrics.encode("utf-8")[:MAX_LYRICS_BYTES].decode("utf-8", errors="ignore"),
                 lyrics_url=lyrics_url,
@@ -153,7 +187,11 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         return self.server  # type: ignore[return-value]
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path != REGISTER_PATH or self.client_address[0] not in {"127.0.0.1", "::1"}:
+        path = self.path.split("?", 1)[0]
+        if path.startswith(MEDIA_PREFIX) and path.endswith("/telemetry"):
+            self._receive_playback_telemetry(path)
+            return
+        if path != REGISTER_PATH or self.client_address[0] not in {"127.0.0.1", "::1"}:
             self.send_error(404)
             return
 
@@ -189,6 +227,12 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         duration_ms = payload.get("duration_ms")
         if not isinstance(duration_ms, int) or duration_ms < 0:
             duration_ms = None
+        song_duration_ms = payload.get("song_duration_ms")
+        if not isinstance(song_duration_ms, int) or song_duration_ms < 0:
+            song_duration_ms = duration_ms
+        playback_access = str(payload.get("playback_access", "full")).strip().lower()
+        if playback_access not in {"full", "preview"}:
+            playback_access = "full"
         public_url, metadata_url = self.proxy_server.register(
             url,
             content_type,
@@ -196,6 +240,8 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             artist=str(payload.get("artist", ""))[:200],
             album=str(payload.get("album", ""))[:200],
             duration_ms=duration_ms,
+            song_duration_ms=song_duration_ms,
+            playback_access=playback_access,
             artwork_url=artwork_url,
             lyrics=str(payload.get("lyrics", "")),
             lyrics_url=lyrics_url,
@@ -209,6 +255,127 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def _receive_playback_telemetry(self, path: str) -> None:
+        parts = path.removeprefix(MEDIA_PREFIX).split("/")
+        if len(parts) != 2 or parts[1] != "telemetry":
+            self.send_error(404)
+            return
+        source = self.proxy_server.resolve(parts[0])
+        if source is None:
+            self.send_error(404, "stream expired or unknown")
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400, "invalid content length")
+            return
+        if content_length <= 0 or content_length > MAX_TELEMETRY_BODY:
+            self.send_error(413)
+            return
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_error(400, "invalid json")
+            return
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            self.send_error(400, "unsupported telemetry schema")
+            return
+        events = payload.get("events")
+        if not isinstance(events, list) or not 1 <= len(events) <= MAX_TELEMETRY_EVENTS:
+            self.send_error(400, "events must be a non-empty bounded list")
+            return
+
+        device_id = str(payload.get("device_id", ""))[:128]
+        session_id = str(payload.get("session_id", ""))[:128]
+        validated: list[tuple[dict[str, object], str, str, str, dict[str, object]]] = []
+        for item in events:
+            if not isinstance(item, dict):
+                self.send_error(400, "invalid telemetry event")
+                return
+            event_type = str(item.get("event_type", "")).strip()
+            event_id = str(item.get("event_id", "")).strip()[:128]
+            playback_id = str(item.get("playback_id", "")).strip()[:128]
+            event_payload = item.get("payload", {})
+            if (
+                event_type not in TELEMETRY_TYPES
+                or not event_id
+                or (event_type in PLAYBACK_TELEMETRY_TYPES and not playback_id)
+                or (event_type in SESSION_TELEMETRY_TYPES and not str(item.get("session_id", session_id)).strip())
+                or not isinstance(event_payload, dict)
+            ):
+                self.send_error(400, "invalid telemetry event")
+                return
+            validated.append((item, event_type, event_id, playback_id, event_payload))
+
+        received_at = datetime.now(timezone.utc)
+        monotonic_values = [
+            float(item[0].get("monotonic_ms"))
+            for item in validated
+            if isinstance(item[0].get("monotonic_ms"), (int, float))
+            and float(item[0].get("monotonic_ms")) >= 0
+        ]
+        batch_monotonic_ms = max(monotonic_values) if monotonic_values else None
+
+        recorder = get_recorder()
+        accepted = 0
+        duplicates = 0
+        for item, event_type, event_id, playback_id, event_payload in validated:
+            if recorder is None:
+                continue
+            authoritative_payload = {
+                **event_payload,
+                "monotonic_ms": item.get("monotonic_ms"),
+                "sequence": item.get("sequence"),
+            }
+            if event_type in PLAYBACK_TELEMETRY_TYPES:
+                authoritative_payload.update(
+                    {
+                        "playback_id": playback_id,
+                        "title": source.title,
+                        "artist": source.artist,
+                        "album": source.album,
+                        "provider": source.provider,
+                        "playback_access": source.playback_access,
+                        "media_duration_ms": source.duration_ms,
+                        "song_duration_ms": source.song_duration_ms,
+                    }
+                )
+            event = recorder.create_event(
+                event_type,
+                source="firmware",
+                event_id=event_id,
+                device_id=device_id,
+                session_id=str(item.get("session_id", session_id))[:128],
+                trace_id=source.trace_id,
+                payload=authoritative_payload,
+                occurred_at=(
+                    received_at
+                    - timedelta(
+                        milliseconds=batch_monotonic_ms - float(item.get("monotonic_ms"))
+                    )
+                    if batch_monotonic_ms is not None
+                    and isinstance(item.get("monotonic_ms"), (int, float))
+                    else received_at
+                ),
+            )
+            try:
+                inserted = recorder.store.append(event)
+            except Exception as exc:
+                LOGGER.warning("播放遥测写入失败：%s", mask_text(str(exc)))
+                self.send_error(503, "telemetry storage unavailable")
+                return
+            accepted += int(inserted)
+            duplicates += int(not inserted)
+        response = json.dumps(
+            {"accepted": accepted, "duplicates": duplicates}, separators=(",", ":")
+        ).encode("utf-8")
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(response)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = self.path.split("?", 1)[0]
@@ -230,7 +397,7 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             return
 
         if resource == "audio":
-            self._report_playback_started(source)
+            self._report_media_stream_requested(source)
             self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
         elif resource == "manifest.json":
             self._serve_manifest(token, source)
@@ -246,10 +413,10 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         if source is None:
             self.send_error(404, "stream expired or unknown")
             return
-        self._report_playback_started(source)
+        self._report_media_stream_requested(source)
         self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
 
-    def _report_playback_started(self, source: StreamSource) -> None:
+    def _report_media_stream_requested(self, source: StreamSource) -> None:
         with source.playback_lock:
             if source.playback_reported:
                 return
@@ -257,7 +424,7 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         recorder = get_recorder()
         if recorder is not None:
             recorder.emit(
-                "playback_started",
+                "media_stream_requested",
                 source="proxy",
                 trace_id=source.trace_id,
                 payload={
@@ -287,10 +454,14 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         body = json.dumps(
             {
                 "schema_version": 1,
+                "trace_id": source.trace_id,
                 "title": source.title,
                 "artist": source.artist,
                 "album": source.album,
                 "duration_ms": source.duration_ms,
+                "song_duration_ms": source.song_duration_ms,
+                "playback_access": source.playback_access,
+                "telemetry_url": self.proxy_server.media_url(token, "telemetry"),
                 "artwork": artwork,
                 "lyrics": lyrics,
             },
