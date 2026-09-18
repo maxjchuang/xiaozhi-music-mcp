@@ -45,9 +45,10 @@ async def test_bridge() -> None:
                 json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             )
             tools = json.loads(await websocket.recv())  # type: ignore[attr-defined]
-            assert [tool["name"] for tool in tools["result"]["tools"]] == [
-                "resolve_music_url"
-            ]
+            assert {tool["name"] for tool in tools["result"]["tools"]} == {
+                "resolve_music_url",
+                "web_search",
+            }
             completed.set_result(None)
         except Exception as exc:
             if not completed.done():
@@ -64,7 +65,8 @@ async def test_bridge() -> None:
         bridge = asyncio.create_task(
             bridge_once(endpoint, PROJECT_DIR / "music_mcp_server.py")
         )
-        await asyncio.wait_for(completed, timeout=10)
+        # Importing FastMCP can take tens of seconds on a cold Python install.
+        await asyncio.wait_for(completed, timeout=90)
         bridge.cancel()
         await asyncio.gather(bridge, return_exceptions=True)
 

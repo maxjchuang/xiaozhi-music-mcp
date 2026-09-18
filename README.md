@@ -108,6 +108,28 @@ FANGPI_API_TIMEOUT_SECONDS=10
 python scripts/accept_music_cache.py
 ```
 
+### 免费联网搜索
+
+项目通过自托管 [SearXNG](https://docs.searxng.org/admin/installation-docker.html) 为小智提供联网搜索，不需要搜索 API Key，也没有按次调用费用。安装 Docker 后，在项目目录启动搜索服务：
+
+```bash
+docker compose -f compose.searxng.yml up -d
+curl -fsS -X POST http://127.0.0.1:8080/search \
+  -d 'q=小智' -d 'format=json' -d 'language=zh-CN' >/dev/null
+```
+
+默认配置只把 SearXNG 绑定到本机 `127.0.0.1:8080`。MCP 服务通过以下环境变量连接：
+
+```dotenv
+WEB_SEARCH_ENABLED=true
+SEARXNG_URL=http://127.0.0.1:8080
+WEB_SEARCH_TIMEOUT_SECONDS=10
+WEB_SEARCH_CACHE_TTL=600
+WEB_SEARCH_SAFESEARCH=1
+```
+
+如果 MCP 服务运行在容器中，需要把 `SEARXNG_URL` 改为该容器能够访问的 SearXNG 地址。SearXNG 会调用其配置的公共搜索来源，搜索软件本身免费，但仍会使用服务器现有的网络和计算资源。
+
 Fangpi 默认启用，因此未配置其他音乐源时仍会尝试搜索；如果 Cloudflare 拒绝独立客户端，可按 [PROVIDERS.md](PROVIDERS.md) 手动配置浏览器 Cookie。网易云和通用非官方适配器默认关闭。乐鑫官方测试音频作为诊断入口始终保留，不依赖音乐源配置。
 
 `.env` 已加入 `.gitignore`。
@@ -173,7 +195,7 @@ python mcp_pipe.py
 动态音乐局域网代理已启动：http://局域网IP:8765/media/<临时令牌>/audio
 ```
 
-然后回到小智控制台刷新 MCP 接入点，应能看到在线状态和 1 个工具：`resolve_music_url`。小智不需要了解各个 Provider，来源选择由服务端完成。
+然后回到小智控制台刷新 MCP 接入点，应能看到在线状态和 2 个工具：`resolve_music_url`、`web_search`。小智不需要了解各个音乐 Provider，来源选择由服务端完成。
 
 角色人物介绍应加入：
 
@@ -182,6 +204,8 @@ python mcp_pipe.py
 先调用外部 MCP 工具 resolve_music_url 搜索歌曲并获得音频 URL。
 解析成功后，必须立即调用设备端 MCP 工具 self.online_music.play_music，
 并原样使用 resolve_music_url 返回的 device_arguments。
+收到需要最新信息、新闻、价格或明确要求联网查询的问题时，调用 web_search，
+根据返回摘要作答，并说明主要来源。不要把 web_search 用于播放音乐。
 ```
 
 新版 EchoEar 固件会同时接收可选的 `device_arguments.metadata_url`，用于显示歌名、歌手、暗化封面、旋转唱片和三行同步歌词。旧固件和旧 URL 播放流程保持兼容。
@@ -449,6 +473,7 @@ python test_mcp_pipe.py
 | 工具 | 功能 |
 |---|---|
 | `resolve_music_url` | 按 Provider 优先级搜索歌曲，生成短期局域网地址并返回 EchoEar 设备工具所需参数 |
+| `web_search` | 通过自托管 SearXNG 搜索互联网，返回标题、摘要、时间和来源链接 |
 
 ## 当前限制
 
@@ -457,6 +482,7 @@ python test_mcp_pipe.py
 - EchoEar 与运行 MCP 的电脑必须在同一局域网，且本机防火墙需允许 Python 接收 TCP 8765 端口的局域网连接。
 - EchoEar 的 URL 播放仍可能经过 Nologo 在线音乐后台，并受设备端 `config_music_player_enabled`、账号或名额限制。
 - 当前自动选择每个 Provider 返回的第一条结果；重名歌曲建议在语音请求中同时说明歌手。
+- 联网搜索依赖 SearXNG 及其上游搜索来源；上游可能限流或临时不可用，服务会返回可读错误而不会影响音乐功能。
 
 ## 安全说明
 

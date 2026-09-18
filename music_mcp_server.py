@@ -18,6 +18,7 @@ from pydantic import Field
 from music_providers import ProviderChain, Track, providers_from_env
 from music_search import MusicSearchResult, SmartMusicSearch
 from usage_analytics import get_recorder
+from web_search import WebSearchError, search_searxng
 
 
 mcp = FastMCP("xiaozhi-music-resolver")
@@ -191,6 +192,92 @@ async def record_event(
             trace_id=trace_id,
             payload=payload,
         )
+
+
+def web_search_enabled() -> bool:
+    return os.getenv("WEB_SEARCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@mcp.tool()
+async def web_search(
+    query: Annotated[
+        str,
+        Field(min_length=1, max_length=500, description="需要联网搜索的问题或关键词"),
+    ],
+    max_results: Annotated[
+        int,
+        Field(ge=1, le=10, description="返回结果数量，默认 5 条"),
+    ] = 5,
+    time_range: Annotated[
+        str,
+        Field(description="可选时间范围：day、month、year；留空表示不限"),
+    ] = "",
+    language: Annotated[
+        str,
+        Field(max_length=20, description="搜索语言，例如 zh-CN、en，默认 zh-CN"),
+    ] = "zh-CN",
+) -> str:
+    """联网搜索最新信息，返回标题、摘要和来源链接。
+
+    涉及新闻、天气、价格、时效信息或用户明确要求联网查询时使用本工具。
+    回答时应基于返回结果，并向用户说明主要信息来源；本工具不读取网页全文。
+    """
+    trace_id = uuid.uuid4().hex
+    started_at = time.monotonic()
+    await record_event("web_search_started", trace_id=trace_id, payload={"query": query})
+    if not web_search_enabled():
+        await record_event(
+            "web_search_failed",
+            trace_id=trace_id,
+            payload={"query": query, "reason": "disabled"},
+        )
+        return json.dumps(
+            {"success": False, "message": "联网搜索已停用，请设置 WEB_SEARCH_ENABLED=true。"},
+            ensure_ascii=False,
+        )
+    try:
+        response = await asyncio.to_thread(
+            search_searxng,
+            query,
+            max_results=max_results,
+            language=language,
+            time_range=time_range,
+        )
+    except WebSearchError as exc:
+        await record_event(
+            "web_search_failed",
+            trace_id=trace_id,
+            payload={
+                "query": query,
+                "reason": str(exc),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            },
+        )
+        return json.dumps({"success": False, "message": str(exc)}, ensure_ascii=False)
+
+    results = [item.public_dict() for item in response.results]
+    await record_event(
+        "web_search_succeeded",
+        trace_id=trace_id,
+        payload={
+            "query": query,
+            "result_count": len(results),
+            "cached": response.cached,
+            "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+        },
+    )
+    return json.dumps(
+        {
+            "success": True,
+            "query": query,
+            "provider": "searxng",
+            "cached": response.cached,
+            "result_count": len(results),
+            "results": results,
+            "answer_instruction": "请综合搜索结果回答，并在关键信息后注明来源标题或链接。",
+        },
+        ensure_ascii=False,
+    )
 
 
 def _success_payload(
