@@ -121,8 +121,6 @@ class WebSearchToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["provider"], "searxng")
         self.assertEqual(payload["result_count"], 1)
-        self.assertIn("每句尽量不超过45个汉字", payload["answer_instruction"])
-        self.assertIn("每轮不超过300个汉字", payload["answer_instruction"])
         self.assertEqual(
             [call.args[0] for call in recorder.emit.call_args_list],
             ["web_search_started", "web_search_succeeded"],

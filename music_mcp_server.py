@@ -276,11 +276,7 @@ async def web_search(
             "cached": response.cached,
             "result_count": len(results),
             "results": results,
-            "answer_instruction": (
-                "请综合搜索结果回答，并说明主要来源。当前是语音设备：使用清晰的中文标点分句，"
-                "每句尽量不超过45个汉字，不要朗读长链接。故事或其他长内容应分段讲述，"
-                "每轮不超过300个汉字，结尾询问用户是否继续。只搜到简介时，应说明是根据简介改编讲述。"
-            ),
+            "answer_instruction": "请综合搜索结果回答，并在关键信息后注明来源标题或链接。",
         },
         ensure_ascii=False,
     )
