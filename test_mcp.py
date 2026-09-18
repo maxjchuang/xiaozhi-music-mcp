@@ -79,6 +79,9 @@ async def test_mcp_server() -> None:
                 tools = await session.list_tools()
                 tool_names = {tool.name for tool in tools.tools}
                 assert tool_names == EXPECTED_TOOLS, tool_names
+                web_search_tool = next(tool for tool in tools.tools if tool.name == "web_search")
+                assert "故事、绘本或图书" in (web_search_tool.description or "")
+                assert "必须先使用本工具搜索" in (web_search_tool.description or "")
 
                 resolved = await session.call_tool(
                     "resolve_music_url", {"query": "播放乐鑫官方测试音频"}
