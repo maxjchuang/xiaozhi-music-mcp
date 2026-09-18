@@ -140,6 +140,43 @@ class UsageAnalyticsTests(unittest.TestCase):
         assert playback is not None
         self.assertEqual(playback["first_audio_wait_ms"], 1750)
 
+    def test_cached_playback_is_preserved_in_projection(self) -> None:
+        recorder = AnalyticsRecorder(self.store)
+        recorder.emit(
+            "music_search_succeeded",
+            source="mcp",
+            trace_id="trace-cache",
+            event_id="search-cache",
+            payload={
+                "query": "海阔天空",
+                "provider": "netease",
+                "cache_hit": True,
+                "cache_id": "cache-1",
+                "delivery_source": "cache",
+            },
+        )
+        recorder.emit(
+            "playback_started",
+            source="firmware",
+            trace_id="trace-cache",
+            event_id="play-cache",
+            payload={
+                "playback_id": "play-cache",
+                "monotonic_ms": 1,
+                "provider": "netease",
+                "cache_hit": True,
+                "cache_id": "cache-1",
+                "delivery_source": "cache",
+            },
+        )
+
+        playback = self.store.get_playback("play-cache")
+        assert playback is not None
+        self.assertEqual(playback["cache_hit"], 1)
+        self.assertEqual(playback["cache_id"], "cache-1")
+        self.assertEqual(playback["delivery_source"], "cache")
+        self.assertEqual(playback["provider"], "netease")
+
     def test_rebuild_playback_projections_is_idempotent(self) -> None:
         recorder = AnalyticsRecorder(self.store)
         recorder.emit(

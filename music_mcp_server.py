@@ -64,7 +64,7 @@ def resolve_diagnostic_track(query: str) -> Track | None:
     return None
 
 
-def _register_proxy_sync(track: Track, trace_id: str = "") -> tuple[str, str]:
+def _register_proxy_sync(track: Track, trace_id: str = "", query: str = "") -> tuple[str, str]:
     register_url = os.getenv("MUSIC_PROXY_REGISTER_URL", "").strip()
     register_token = os.getenv("MUSIC_PROXY_REGISTER_TOKEN", "").strip()
     if not register_url:
@@ -88,6 +88,8 @@ def _register_proxy_sync(track: Track, trace_id: str = "") -> tuple[str, str]:
             "lyrics": track.lyrics,
             "lyrics_url": track.lyrics_url,
             "provider": track.provider,
+            "track_id": track.track_id,
+            "query": query,
             "trace_id": trace_id,
         }
     ).encode("utf-8")
@@ -112,8 +114,66 @@ def _register_proxy_sync(track: Track, trace_id: str = "") -> tuple[str, str]:
     return public_url, str(payload.get("metadata_url", "")).strip()
 
 
-async def register_proxy(track: Track, trace_id: str = "") -> tuple[str, str]:
-    return await asyncio.to_thread(_register_proxy_sync, track, trace_id)
+async def register_proxy(track: Track, trace_id: str = "", query: str = "") -> tuple[str, str]:
+    return await asyncio.to_thread(_register_proxy_sync, track, trace_id, query)
+
+
+def _lookup_cached_track_sync(query: str, trace_id: str) -> tuple[Track, str, str, str] | None:
+    lookup_url = os.getenv("MUSIC_PROXY_CACHE_LOOKUP_URL", "").strip()
+    register_token = os.getenv("MUSIC_PROXY_REGISTER_TOKEN", "").strip()
+    if not lookup_url:
+        return None
+    body = json.dumps({"query": query, "trace_id": trace_id}).encode("utf-8")
+    request = Request(
+        lookup_url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {register_token}",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+    )
+    try:
+        with urlopen(request, timeout=2) as response:
+            payload = json.load(response)
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None
+        return None
+    except (URLError, TimeoutError, OSError, ValueError):
+        return None
+    raw = payload.get("track")
+    audio_url = str(payload.get("url", "")).strip()
+    if not isinstance(raw, dict) or not audio_url:
+        return None
+    duration_ms = raw.get("duration_ms")
+    song_duration_ms = raw.get("song_duration_ms")
+    track = Track(
+        provider=str(raw.get("provider", "cache")),
+        track_id=str(raw.get("track_id", raw.get("cache_id", ""))),
+        title=str(raw.get("title", "")),
+        artist=str(raw.get("artist", "")),
+        audio_url=audio_url,
+        album=str(raw.get("album", "")),
+        duration=duration_ms // 1000 if isinstance(duration_ms, int) else None,
+        song_duration=song_duration_ms // 1000 if isinstance(song_duration_ms, int) else None,
+        content_type="audio/mpeg",
+        artwork_url=str(raw.get("artwork_url", "")),
+        lyrics=str(raw.get("lyrics", "")),
+        lyrics_url=str(raw.get("lyrics_url", "")),
+        access_status="full",
+    )
+    return (
+        track,
+        audio_url,
+        str(payload.get("metadata_url", "")).strip(),
+        str(raw.get("cache_id", "")),
+    )
+
+
+async def lookup_cached_track(query: str, trace_id: str) -> tuple[Track, str, str, str] | None:
+    return await asyncio.to_thread(_lookup_cached_track_sync, query, trace_id)
 
 
 async def record_event(
@@ -138,6 +198,9 @@ def _success_payload(
     audio_url: str,
     metadata_url: str,
     failures: list[dict[str, str]],
+    *,
+    cache_hit: bool = False,
+    cache_id: str = "",
 ) -> str:
     device_arguments: dict[str, Any] = {
         "play_type": "url",
@@ -154,6 +217,9 @@ def _success_payload(
             "next_step": "立即调用设备端 MCP 工具 self.online_music.play_music",
             "device_tool": "self.online_music.play_music",
             "metadata_url": metadata_url or None,
+            "cache_hit": cache_hit,
+            "cache_id": cache_id or None,
+            "delivery_source": "cache" if cache_hit else "network",
             "device_arguments": device_arguments,
         }
     if track.is_preview:
@@ -208,8 +274,41 @@ async def resolve_music_url(
         trace_id=trace_id,
         payload={"query": query},
     )
+    cache_started_at = time.monotonic()
+    cached = await lookup_cached_track(query, trace_id)
+    await record_event(
+        "music_cache_lookup",
+        trace_id=trace_id,
+        payload={
+            "query": query,
+            "cache_hit": cached is not None,
+            "delivery_source": "cache" if cached is not None else "network",
+            "elapsed_ms": round((time.monotonic() - cache_started_at) * 1000),
+        },
+    )
+    if cached is not None:
+        track, audio_url, metadata_url, cache_id = cached
+        await record_event(
+            "music_search_succeeded",
+            trace_id=trace_id,
+            payload={
+                "query": query,
+                "provider": track.provider,
+                "title": track.title,
+                "artist": track.artist,
+                "album": track.album,
+                "duration_ms": track.duration * 1000 if track.duration is not None else None,
+                "cache_hit": True,
+                "cache_id": cache_id,
+                "delivery_source": "cache",
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            },
+        )
+        return _success_payload(
+            track, audio_url, metadata_url, [], cache_hit=True, cache_id=cache_id
+        )
     if diagnostic := resolve_diagnostic_track(query):
-        audio_url, metadata_url = await register_proxy(diagnostic, trace_id)
+        audio_url, metadata_url = await register_proxy(diagnostic, trace_id, query)
         await record_event(
             "music_search_succeeded",
             trace_id=trace_id,
@@ -219,6 +318,8 @@ async def resolve_music_url(
                 "title": diagnostic.title,
                 "artist": diagnostic.artist,
                 "duration_ms": diagnostic.duration * 1000 if diagnostic.duration is not None else None,
+                "cache_hit": False,
+                "delivery_source": "network",
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000),
             },
         )
@@ -299,7 +400,7 @@ async def resolve_music_url(
         )
 
     try:
-        audio_url, metadata_url = await register_proxy(track, trace_id)
+        audio_url, metadata_url = await register_proxy(track, trace_id, query)
     except RuntimeError as exc:
         await record_event(
             "music_search_failed",
@@ -332,6 +433,8 @@ async def resolve_music_url(
             "artist": track.artist,
             "album": track.album,
             "duration_ms": track.duration * 1000 if track.duration is not None else None,
+            "cache_hit": False,
+            "delivery_source": "network",
             "fallback_failures": failures,
             **(_search_diagnostics(smart_result) if smart_result else {}),
             "elapsed_ms": round((time.monotonic() - started_at) * 1000),

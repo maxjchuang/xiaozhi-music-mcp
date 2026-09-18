@@ -19,6 +19,9 @@ music_mcp_server.py（按优先级搜索歌曲）
 - `mcp_pipe.py` 主动连接 `MCP_ENDPOINT`，因此本地运行时不需要公网 IP 或端口映射。
 - `music_mcp_server.py` 是标准 FastMCP stdio 服务。
 - `mcp_pipe.py` 会在局域网启动动态音频代理，隐藏上游鉴权信息并解决部分 ESP32 无法直连 HTTPS/CDN 的问题；默认端口为 `8765`。
+- 完整歌曲实际开始请求后，代理会将上游响应保存为可独立播放的标准 MP3。再次请求相同歌曲时优先返回本地文件，不再搜索外部音乐源。试听歌曲不会缓存。
+- 缓存默认位于 `~/Music/XiaozhiMusicCache`，上限为 50 GiB；达到上限后按最近最少使用顺序自动清理。可以通过 `MUSIC_CACHE_DIR` 和 `MUSIC_CACHE_MAX_BYTES` 调整。
+- 缓存查询、保存、淘汰和实际缓存播放都会进入本地行为分析；启用飞书同步后，原始事件、播放明细和缓存命中率仪表盘也会同步更新。升级已有飞书表后运行一次 `bash scripts/music_service.sh analytics init` 即可自动补齐字段和图表。
 - 新版代理会为每首歌生成短期媒体清单。封面按需裁剪为 360 × 360 暗化背景和 192 × 192 唱片；可用歌词以 LRC 转发。旧 `/stream/<令牌>` 地址仍兼容。
 - Provider 配置和非官方适配器协议见 [PROVIDERS.md](PROVIDERS.md)。
 - 使用行为记录和飞书仪表盘的基础架构见 [飞书行为分析设计](docs/FEISHU_ANALYTICS_DESIGN.md)，固件遥测、播放时长、自然完播率和搜索不满意分析见 [飞书数据分析第二阶段方案](docs/FEISHU_ANALYTICS_PHASE2_DESIGN.md)，当前实施进度见 [代码实施计划](docs/FEISHU_ANALYTICS_IMPLEMENTATION_PLAN.md)。
@@ -98,6 +101,12 @@ FANGPI_API_TIMEOUT_SECONDS=10
 ```
 
 当前 EchoEar 测试固件固定允许端口 `8765`，请勿修改该值。
+
+音乐缓存可以通过以下命令完成全自动验收，无需连接真实音乐服务或设备：
+
+```bash
+python scripts/accept_music_cache.py
+```
 
 Fangpi 默认启用，因此未配置其他音乐源时仍会尝试搜索；如果 Cloudflare 拒绝独立客户端，可按 [PROVIDERS.md](PROVIDERS.md) 手动配置浏览器 Cookie。网易云和通用非官方适配器默认关闭。乐鑫官方测试音频作为诊断入口始终保留，不依赖音乐源配置。
 

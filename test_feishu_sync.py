@@ -18,6 +18,7 @@ from feishu_sync import (
     FeishuSyncWorker,
     _batch_token,
     event_fields,
+    playback_fields,
 )
 from usage_analytics import AnalyticsEvent, AnalyticsStore
 
@@ -50,6 +51,35 @@ class FeishuSyncTests(unittest.TestCase):
         self.assertEqual(fields["事件ID"], "event-1")
         self.assertIn("海阔天空", fields["事件摘要"])
         self.assertEqual(_batch_token([event]), _batch_token([event]))
+
+    def test_cache_fields_are_mapped_to_feishu(self) -> None:
+        event = AnalyticsEvent.create(
+            "music_cache_saved",
+            source="proxy",
+            payload={
+                "cache_hit": True,
+                "delivery_source": "cache",
+                "cache_id": "cache-1",
+                "size_bytes": 1234,
+            },
+        )
+        fields = event_fields(event)
+        self.assertTrue(fields["缓存命中"])
+        self.assertEqual(fields["传输来源"], "cache")
+        self.assertEqual(fields["缓存ID"], "cache-1")
+        self.assertEqual(fields["缓存字节"], 1234)
+        playback = playback_fields(
+            {
+                "playback_id": "play-cache",
+                "provider": "netease",
+                "cache_hit": 1,
+                "delivery_source": "cache",
+                "cache_id": "cache-1",
+            }
+        )
+        self.assertTrue(playback["缓存播放"])
+        self.assertEqual(playback["Provider"], "netease")
+        self.assertEqual(playback["传输来源"], "cache")
 
     def test_sync_uses_cli_api_with_idempotency_token(self) -> None:
         events = [
