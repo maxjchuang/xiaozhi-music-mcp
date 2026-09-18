@@ -30,12 +30,14 @@ import websockets
 
 from usage_analytics import get_recorder, mask_text
 from feishu_sync import start_sync_worker
+from music_cache import CacheCommitResult, MusicCache
 
 
 LOGGER = logging.getLogger("xiaozhi-mcp-pipe")
 INITIAL_BACKOFF_SECONDS = 1
 MAX_BACKOFF_SECONDS = 60
 REGISTER_PATH = "/_register"
+CACHE_LOOKUP_PATH = "/_cache/lookup"
 STREAM_PREFIX = "/stream/"
 MEDIA_PREFIX = "/media/"
 MAX_REGISTER_BODY = 96 * 1024
@@ -88,6 +90,11 @@ class StreamSource:
     lyrics_url: str = ""
     provider: str = ""
     trace_id: str = ""
+    track_id: str = ""
+    query: str = ""
+    cache_id: str = ""
+    cached_audio_path: str = ""
+    cache_hit: bool = False
     playback_reported: bool = False
     playback_lock: threading.Lock = field(default_factory=threading.Lock)
     background_jpeg: bytes | None = None
@@ -105,6 +112,18 @@ class AudioProxyServer(ThreadingHTTPServer):
         self.stream_ttl = max(60, int(os.getenv("MUSIC_PROXY_STREAM_TTL", "1800")))
         self.streams: dict[str, StreamSource] = {}
         self.streams_lock = threading.Lock()
+        cache_enabled = os.getenv("MUSIC_CACHE_ENABLED", "true").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        cache_max_bytes = max(
+            0, int(os.getenv("MUSIC_CACHE_MAX_BYTES", str(50 * 1024**3)))
+        )
+        self.music_cache = MusicCache(
+            os.getenv("MUSIC_CACHE_DIR", "~/Music/XiaozhiMusicCache"),
+            cache_max_bytes if cache_enabled else 0,
+        )
+        self.cache_downloads: set[str] = set()
+        self.cache_downloads_lock = threading.Lock()
 
     def register(
         self,
@@ -122,6 +141,11 @@ class AudioProxyServer(ThreadingHTTPServer):
         lyrics_url: str = "",
         provider: str = "",
         trace_id: str = "",
+        track_id: str = "",
+        query: str = "",
+        cache_id: str = "",
+        cached_audio_path: str = "",
+        cache_hit: bool = False,
     ) -> tuple[str, str]:
         now = time.time()
         token = secrets.token_urlsafe(18)
@@ -147,6 +171,11 @@ class AudioProxyServer(ThreadingHTTPServer):
                 lyrics_url=lyrics_url,
                 provider=provider,
                 trace_id=trace_id,
+                track_id=track_id,
+                query=query,
+                cache_id=cache_id,
+                cached_audio_path=cached_audio_path,
+                cache_hit=cache_hit,
             )
         return (
             f"{self.public_base_url}{MEDIA_PREFIX}{token}/audio",
@@ -163,6 +192,146 @@ class AudioProxyServer(ThreadingHTTPServer):
 
     def media_url(self, token: str, name: str) -> str:
         return f"{self.public_base_url}{MEDIA_PREFIX}{token}/{name}"
+
+    def lookup_cached(self, query: str, trace_id: str) -> dict[str, object] | None:
+        cached = self.music_cache.lookup(query)
+        if cached is None:
+            return None
+        audio_url, metadata_url = self.register(
+            "",
+            cached.content_type,
+            cached.title,
+            artist=cached.artist,
+            album=cached.album,
+            duration_ms=cached.duration_ms,
+            song_duration_ms=cached.song_duration_ms,
+            playback_access="full",
+            artwork_url=cached.artwork_url,
+            lyrics=cached.lyrics,
+            lyrics_url=cached.lyrics_url,
+            provider=cached.provider,
+            trace_id=trace_id,
+            track_id=cached.track_id,
+            query=query,
+            cache_id=cached.cache_id,
+            cached_audio_path=cached.audio_path,
+            cache_hit=True,
+        )
+        return {
+            "url": audio_url,
+            "metadata_url": metadata_url,
+            "track": cached.as_dict(),
+        }
+
+    def claim_cache_download(self, source: StreamSource) -> str:
+        if (
+            not self.music_cache.enabled
+            or source.playback_access != "full"
+            or source.cached_audio_path
+            or not source.url
+        ):
+            return ""
+        key = f"{source.provider}\0{source.track_id}\0{source.url}"
+        with self.cache_downloads_lock:
+            if key in self.cache_downloads:
+                return ""
+            self.cache_downloads.add(key)
+        return key
+
+    def release_cache_download(self, key: str) -> None:
+        if key:
+            with self.cache_downloads_lock:
+                self.cache_downloads.discard(key)
+
+    def commit_cached_audio(self, temporary_path: Path, source: StreamSource) -> None:
+        result = self.music_cache.commit(
+            temporary_path,
+            {
+                "provider": source.provider,
+                "track_id": source.track_id,
+                "title": source.title,
+                "artist": source.artist,
+                "album": source.album,
+                "duration_ms": source.duration_ms,
+                "song_duration_ms": source.song_duration_ms,
+                "artwork_url": source.artwork_url,
+                "lyrics": source.lyrics,
+                "lyrics_url": source.lyrics_url,
+            },
+            [
+                source.query,
+                source.title,
+                f"{source.title} {source.artist}",
+                f"{source.artist} {source.title}",
+            ],
+        )
+        if result is None:
+            return
+        self._record_cache_commit(source, result)
+
+    def _record_cache_commit(self, source: StreamSource, result: CacheCommitResult) -> None:
+        recorder = get_recorder()
+        if recorder is None:
+            return
+        recorder.emit(
+            "music_cache_saved",
+            source="proxy",
+            trace_id=source.trace_id,
+            payload={
+                "cache_id": result.track.cache_id,
+                "provider": source.provider,
+                "track_id": source.track_id,
+                "title": source.title,
+                "artist": source.artist,
+                "size_bytes": result.track.size_bytes,
+            },
+        )
+        for evicted in result.evicted:
+            recorder.emit(
+                "music_cache_evicted",
+                source="proxy",
+                payload={
+                    "cache_id": evicted.cache_id,
+                    "provider": evicted.provider,
+                    "track_id": evicted.track_id,
+                    "title": evicted.title,
+                    "artist": evicted.artist,
+                    "size_bytes": evicted.size_bytes,
+                    "reason": "capacity",
+                },
+            )
+
+    def cache_in_background(self, source: StreamSource) -> None:
+        key = self.claim_cache_download(source)
+        if not key:
+            return
+
+        def download() -> None:
+            temporary_path: Path | None = None
+            try:
+                request = Request(
+                    source.url,
+                    headers={"User-Agent": "xiaozhi-music-mcp/2.1", "Accept": "audio/mpeg"},
+                )
+                with urlopen(request, timeout=30, context=upstream_ssl_context()) as upstream:
+                    output, temporary_path = self.music_cache.create_temporary_file()
+                    downloaded = 0
+                    with output:
+                        while chunk := upstream.read(64 * 1024):
+                            downloaded += len(chunk)
+                            if downloaded > self.music_cache.max_bytes:
+                                raise ValueError("audio exceeds cache capacity")
+                            output.write(chunk)
+                self.commit_cached_audio(temporary_path, source)
+                temporary_path = None
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                LOGGER.warning("音频后台缓存失败（%s）：%s", source.title, exc)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                self.release_cache_download(key)
+
+        threading.Thread(target=download, name="music-cache-download", daemon=True).start()
 
 
 def upstream_ssl_context() -> ssl.SSLContext:
@@ -191,7 +360,7 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         if path.startswith(MEDIA_PREFIX) and path.endswith("/telemetry"):
             self._receive_playback_telemetry(path)
             return
-        if path != REGISTER_PATH or self.client_address[0] not in {"127.0.0.1", "::1"}:
+        if path not in {REGISTER_PATH, CACHE_LOOKUP_PATH} or self.client_address[0] not in {"127.0.0.1", "::1"}:
             self.send_error(404)
             return
 
@@ -211,6 +380,22 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(content_length))
         except (UnicodeDecodeError, json.JSONDecodeError):
             self.send_error(400, "invalid json")
+            return
+        if path == CACHE_LOOKUP_PATH:
+            query = str(payload.get("query", ""))[:500]
+            result = self.proxy_server.lookup_cached(
+                query, str(payload.get("trace_id", ""))[:128]
+            )
+            if result is None:
+                self.send_error(404, "cache miss")
+                return
+            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
             return
         url = str(payload.get("url", "")).strip()
         if not _valid_upstream_url(url):
@@ -247,6 +432,8 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             lyrics_url=lyrics_url,
             provider=str(payload.get("provider", ""))[:100],
             trace_id=str(payload.get("trace_id", ""))[:128],
+            track_id=str(payload.get("track_id", ""))[:200],
+            query=str(payload.get("query", ""))[:500],
         )
         body = json.dumps({"url": public_url, "metadata_url": metadata_url}).encode("utf-8")
         self.send_response(201)
@@ -337,6 +524,9 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
                         "album": source.album,
                         "provider": source.provider,
                         "playback_access": source.playback_access,
+                        "cache_hit": source.cache_hit,
+                        "cache_id": source.cache_id,
+                        "delivery_source": "cache" if source.cache_hit else "network",
                         "media_duration_ms": source.duration_ms,
                         "song_duration_ms": source.song_duration_ms,
                     }
@@ -398,7 +588,10 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
 
         if resource == "audio":
             self._report_media_stream_requested(source)
-            self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
+            if source.cached_audio_path:
+                self._serve_cached_audio(source)
+            else:
+                self._proxy_upstream(source, allow_range=True)
         elif resource == "manifest.json":
             self._serve_manifest(token, source)
         elif resource == "lyrics.lrc":
@@ -414,7 +607,10 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404, "stream expired or unknown")
             return
         self._report_media_stream_requested(source)
-        self._proxy_upstream(source.url, source.content_type, source.title, allow_range=True)
+        if source.cached_audio_path:
+            self._serve_cached_audio(source)
+        else:
+            self._proxy_upstream(source, allow_range=True)
 
     def _report_media_stream_requested(self, source: StreamSource) -> None:
         with source.playback_lock:
@@ -433,8 +629,58 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
                     "album": source.album,
                     "provider": source.provider,
                     "duration_ms": source.duration_ms,
+                    "cache_hit": source.cache_hit,
+                    "cache_id": source.cache_id,
+                    "delivery_source": "cache" if source.cache_hit else "network",
                 },
             )
+
+    def _serve_cached_audio(self, source: StreamSource) -> None:
+        path = Path(source.cached_audio_path)
+        try:
+            size = path.stat().st_size
+            start, end = 0, size - 1
+            status = 200
+            if range_header := self.headers.get("Range"):
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+                if not match:
+                    raise ValueError("invalid range")
+                if match.group(1):
+                    start = int(match.group(1))
+                    end = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+                elif match.group(2):
+                    length = min(int(match.group(2)), size)
+                    start = size - length
+                if start > end or start >= size:
+                    raise ValueError("range out of bounds")
+                status = 206
+            length = end - start + 1
+            self.send_response(status)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            with path.open("rb") as cached:
+                cached.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = cached.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except ValueError:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except OSError as exc:
+            LOGGER.warning("本地缓存读取失败（%s）：%s", source.title, exc)
+            self.send_error(404, "cached audio unavailable")
 
     def _serve_manifest(self, token: str, source: StreamSource) -> None:
         artwork = None
@@ -526,33 +772,79 @@ class AudioProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _proxy_upstream(self, url: str, content_type: str, title: str, *, allow_range: bool) -> None:
-
+    def _proxy_upstream(self, source: StreamSource, *, allow_range: bool) -> None:
         headers = {"User-Agent": "xiaozhi-music-mcp/1.0", "Accept": "audio/mpeg"}
-        if allow_range and (range_header := self.headers.get("Range")):
+        range_header = self.headers.get("Range") if allow_range else None
+        if range_header:
             headers["Range"] = range_header
-        request = Request(url, headers=headers)
+        request = Request(source.url, headers=headers)
+        cache_key = ""
+        if not range_header or re.fullmatch(r"bytes=0-\d*", range_header.strip()):
+            cache_key = self.proxy_server.claim_cache_download(source)
+        else:
+            self.proxy_server.cache_in_background(source)
+        temporary_path: Path | None = None
         try:
             with urlopen(request, timeout=30, context=upstream_ssl_context()) as upstream:
+                response_is_complete = upstream.status == 200
+                if upstream.status == 206:
+                    content_range = upstream.headers.get("Content-Range", "")
+                    match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", content_range)
+                    response_is_complete = bool(
+                        match and int(match.group(1)) + 1 == int(match.group(2))
+                    )
+                output = None
+                if cache_key and response_is_complete:
+                    output, temporary_path = self.proxy_server.music_cache.create_temporary_file()
                 self.send_response(upstream.status)
                 for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
                     if value := upstream.headers.get(name):
                         self.send_header(name, value)
                 if not upstream.headers.get("Content-Type"):
-                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Type", source.content_type)
                 self.send_header("Connection", "close")
                 self.end_headers()
-                while chunk := upstream.read(64 * 1024):
-                    self.wfile.write(chunk)
+                client_connected = True
+                cached_bytes = 0
+                try:
+                    while chunk := upstream.read(64 * 1024):
+                        if output is not None:
+                            cached_bytes += len(chunk)
+                            if cached_bytes <= self.proxy_server.music_cache.max_bytes:
+                                output.write(chunk)
+                            else:
+                                output.close()
+                                output = None
+                                temporary_path.unlink(missing_ok=True)
+                                temporary_path = None
+                        if client_connected:
+                            try:
+                                self.wfile.write(chunk)
+                            except (BrokenPipeError, ConnectionResetError):
+                                client_connected = False
+                finally:
+                    if output is not None:
+                        output.close()
+                if temporary_path is not None:
+                    self.proxy_server.commit_cached_audio(temporary_path, source)
+                    temporary_path = None
+                elif cache_key and not response_is_complete:
+                    self.proxy_server.release_cache_download(cache_key)
+                    cache_key = ""
+                    self.proxy_server.cache_in_background(source)
         except HTTPError as exc:
-            LOGGER.warning("音频上游返回 HTTP %s（%s）", exc.code, title)
+            LOGGER.warning("音频上游返回 HTTP %s（%s）", exc.code, source.title)
             self.send_error(502, "upstream HTTP error")
         except (URLError, TimeoutError, OSError) as exc:
-            LOGGER.warning("音频代理失败（%s）：%s", title, exc)
+            LOGGER.warning("音频代理失败（%s）：%s", source.title, exc)
             try:
                 self.send_error(502, "upstream unavailable")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            self.proxy_server.release_cache_download(cache_key)
 
     def log_message(self, message_format: str, *args: object) -> None:
         LOGGER.info("[audio-proxy] %s", message_format % args)
@@ -643,6 +935,7 @@ def start_audio_proxy() -> AudioProxyServer:
     server = AudioProxyServer(("0.0.0.0", port), public_base_url, register_token)
     server.daemon_threads = True
     os.environ["MUSIC_PROXY_REGISTER_URL"] = f"http://127.0.0.1:{port}{REGISTER_PATH}"
+    os.environ["MUSIC_PROXY_CACHE_LOOKUP_URL"] = f"http://127.0.0.1:{port}{CACHE_LOOKUP_PATH}"
     os.environ["MUSIC_PROXY_REGISTER_TOKEN"] = register_token
     thread = threading.Thread(target=server.serve_forever, name="audio-proxy", daemon=True)
     thread.start()

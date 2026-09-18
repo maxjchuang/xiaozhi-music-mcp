@@ -95,9 +95,41 @@ class MusicAnalyticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(payload["success"])
         event_types = [call.args[0] for call in recorder.emit.call_args_list]
-        self.assertEqual(event_types, ["music_search_started", "music_search_succeeded"])
+        self.assertEqual(
+            event_types,
+            ["music_search_started", "music_cache_lookup", "music_search_succeeded"],
+        )
         trace_ids = [call.kwargs["trace_id"] for call in recorder.emit.call_args_list]
         self.assertEqual(len(set(trace_ids)), 1)
+
+    async def test_cache_hit_skips_all_network_providers(self) -> None:
+        cached_track = Track(
+            "netease", "1", "海阔天空", "Beyond", "http://lan/cached.mp3"
+        )
+        recorder = MagicMock()
+        providers = MagicMock()
+        with (
+            patch("music_mcp_server.get_recorder", return_value=recorder),
+            patch(
+                "music_mcp_server.lookup_cached_track",
+                new=AsyncMock(
+                    return_value=(
+                        cached_track,
+                        cached_track.audio_url,
+                        "http://lan/manifest.json",
+                        "cache-1",
+                    )
+                ),
+            ),
+            patch("music_mcp_server.providers_from_env", providers),
+        ):
+            payload = json.loads(await resolve_music_url("播放海阔天空"))
+
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["cache_hit"])
+        self.assertEqual(payload["cache_id"], "cache-1")
+        self.assertEqual(payload["delivery_source"], "cache")
+        providers.assert_not_called()
 
 
 if __name__ == "__main__":

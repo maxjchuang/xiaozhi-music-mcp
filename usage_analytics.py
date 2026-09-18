@@ -270,6 +270,9 @@ class AnalyticsStore:
                     artist TEXT NOT NULL DEFAULT '',
                     album TEXT NOT NULL DEFAULT '',
                     provider TEXT NOT NULL DEFAULT '',
+                    cache_hit INTEGER NOT NULL DEFAULT 0,
+                    cache_id TEXT NOT NULL DEFAULT '',
+                    delivery_source TEXT NOT NULL DEFAULT 'network',
                     original_query TEXT NOT NULL DEFAULT '',
                     normalized_query TEXT NOT NULL DEFAULT '',
                     playback_access TEXT NOT NULL DEFAULT 'full',
@@ -348,6 +351,9 @@ class AnalyticsStore:
                     "dissatisfaction_reason": "TEXT NOT NULL DEFAULT ''",
                     "next_action": "TEXT NOT NULL DEFAULT ''",
                     "first_audio_wait_ms": "INTEGER NOT NULL DEFAULT 0",
+                    "cache_hit": "INTEGER NOT NULL DEFAULT 0",
+                    "cache_id": "TEXT NOT NULL DEFAULT ''",
+                    "delivery_source": "TEXT NOT NULL DEFAULT 'network'",
                 },
             )
             self._ensure_columns(
@@ -558,6 +564,21 @@ class AnalyticsStore:
         play_ratio = min(1.0, audible_ms / media_duration) if media_duration else None
         quick_skip_level = self._quick_skip_level(end_reason, audible_ms, media_duration)
         natural_completed = int(end_reason == "natural_completed")
+        cache_hit = int(
+            bool(payload.get("cache_hit"))
+            or bool(search_context.get("cache_hit"))
+            or bool(existing.get("cache_hit", 0))
+        )
+        cache_id = str(
+            payload.get("cache_id")
+            or search_context.get("cache_id")
+            or existing.get("cache_id", "")
+        )[:128]
+        delivery_source = str(
+            payload.get("delivery_source")
+            or search_context.get("delivery_source")
+            or existing.get("delivery_source", "cache" if cache_hit else "network")
+        )[:50]
         revision = int(existing.get("revision", 0)) + 1
         last_clock = max(previous_clock, incoming_clock if incoming_clock is not None else previous_clock)
         values = (
@@ -566,6 +587,7 @@ class AnalyticsStore:
             event.device_id or str(existing.get("device_id", "")),
             event.session_id or str(existing.get("session_id", "")),
             text("title"), text("artist"), text("album"), text("provider"),
+            cache_hit, cache_id, delivery_source,
             str(search_context.get("query") or existing.get("original_query", ""))[:500],
             str(search_context.get("normalized_query") or search_context.get("query") or existing.get("normalized_query", ""))[:500],
             text("playback_access", "full"), media_duration, song_duration,
@@ -582,18 +604,21 @@ class AnalyticsStore:
             """
             INSERT INTO playbacks (
                 playback_id, trace_id, device_id, session_id, title, artist, album,
-                provider, original_query, normalized_query, playback_access,
+                provider, cache_hit, cache_id, delivery_source,
+                original_query, normalized_query, playback_access,
                 media_duration_ms, song_duration_ms,
                 requested_at, started_at, ended_at, first_audio_wait_ms, audible_played_ms,
                 elapsed_since_start_ms, pause_total_ms, pause_count, underrun_count,
                 underrun_total_ms, end_reason, natural_completed, quick_skip_level,
                 suspected_search_dissatisfaction, dissatisfaction_reason, next_action,
                 play_ratio, status, revision, last_monotonic_ms, last_event_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(playback_id) DO UPDATE SET
                 trace_id=excluded.trace_id, device_id=excluded.device_id,
                 session_id=excluded.session_id, title=excluded.title, artist=excluded.artist,
                 album=excluded.album, provider=excluded.provider,
+                cache_hit=excluded.cache_hit, cache_id=excluded.cache_id,
+                delivery_source=excluded.delivery_source,
                 original_query=excluded.original_query,
                 normalized_query=excluded.normalized_query,
                 playback_access=excluded.playback_access,
